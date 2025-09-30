@@ -614,26 +614,29 @@ func (p *Processor) tryReadCache(ctx context.Context, url string) (string, bool)
 
 // writeCache saves HTML to cache file (best-effort).
 func (p *Processor) writeCache(ctx context.Context, url, html string) error {
-	// Write to Redis if configured
-	if p.rc != nil {
-		key := p.rc.Key("html", hashURL(url))
-		if err := p.rc.SetString(ctx, key, html); err != nil {
-			log.Printf("[reader] redis set error: %v", err)
-		}
-	}
-	// Also write to local file cache when enabled (keeps debug traceability)
-	path := p.cacheFilePath(url)
-	if path == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(html), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+    // When Redis is configured, use Redis only and do not write local files
+    if p.rc != nil {
+        key := p.rc.Key("html", hashURL(url))
+        if err := p.rc.SetString(ctx, key, html); err != nil {
+            log.Printf("[reader] redis set html error: %v", err)
+        } else {
+            log.Printf("[reader] redis set html ok key=%s bytes=%d ttl=%ds", key, len(html), p.cfg.RedisTTLSeconds)
+        }
+        return nil
+    }
+    // Local file cache (when Redis not in use)
+    path := p.cacheFilePath(url)
+    if path == "" {
+        return nil
+    }
+    if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+        return err
+    }
+    tmp := path + ".tmp"
+    if err := os.WriteFile(tmp, []byte(html), 0o644); err != nil {
+        return err
+    }
+    return os.Rename(tmp, path)
 }
 
 func (p *Processor) cacheFilePath(url string) string {
@@ -696,28 +699,31 @@ func (p *Processor) tryReadMetaCache(ctx context.Context, url string) (map[strin
 }
 
 func (p *Processor) writeMetaCache(ctx context.Context, url string, body map[string]any) error {
-	// Marshal once for both Redis and file
-	b, _ := json.MarshalIndent(body, "", "  ")
-	// Redis
-	if p.rc != nil {
-		key := p.rc.Key("body", hashURL(url))
-		if err := p.rc.SetString(ctx, key, string(b)); err != nil {
-			log.Printf("[reader] redis set body error: %v", err)
-		}
-	}
-	// File
-	path := p.cacheMetaFilePath(url)
-	if path == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+    // Marshal once for Redis and/or file
+    b, _ := json.MarshalIndent(body, "", "  ")
+    if p.rc != nil {
+        key := p.rc.Key("body", hashURL(url))
+        if err := p.rc.SetString(ctx, key, string(b)); err != nil {
+            log.Printf("[reader] redis set body error: %v", err)
+        } else {
+            log.Printf("[reader] redis set body ok key=%s bytes=%d ttl=%ds", key, len(b), p.cfg.RedisTTLSeconds)
+        }
+        // Do not write local files when Redis is enabled
+        return nil
+    }
+    // File (when Redis not in use)
+    path := p.cacheMetaFilePath(url)
+    if path == "" {
+        return nil
+    }
+    if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+        return err
+    }
+    tmp := path + ".tmp"
+    if err := os.WriteFile(tmp, b, 0o644); err != nil {
+        return err
+    }
+    return os.Rename(tmp, path)
 }
 
 // buildReadwiseBody converts extracted meta into a strictly-typed Reader API body
