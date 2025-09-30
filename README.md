@@ -17,7 +17,7 @@
 │   ├── server/
 │   │   └── handlers.go      # HTTP 路由与处理
 │   └── wecom/
-│       └── crypto.go        # WeCom 加解密与验签
+│       └── wxbizmsgcrypt.go # 官方加解密实现（已内置）
 ├── go.mod
 └── README.md
 ```
@@ -63,17 +63,16 @@ GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
 
 ## 回调 URL 配置与接口
 
-企业微信后台“回调 URL”可以配置为：
-- 根路径：`https://<your-domain>/`（本项目已支持）
-- 指定路径：`https://<your-domain>/callback`
+企业微信后台“回调 URL”推荐配置为根路径：
+- 根路径：`https://<your-domain>/`（本项目仅支持根路径）
 
 同一个回调 URL 同时承担两种行为：
 - `GET` 验证 URL：企业微信会携带 `msg_signature`、`timestamp`、`nonce`、`echostr` 参数发起请求，服务端需要验签并解密 `echostr` 原样返回。
 - `POST` 接收消息：企业微信会携带 `msg_signature`、`timestamp`、`nonce` 参数，并在 Body 的 XML 里包含 `<Encrypt>` 字段。
 
-- `GET /callback` 或 `GET /`：URL 校验。参数 `msg_signature`、`timestamp`、`nonce`、`echostr`。
+- `GET /`：URL 校验。参数 `msg_signature`、`timestamp`、`nonce`、`echostr`。
   - 验签并解密 `echostr`，原样返回解密后的 echo 字符串。
-- `POST /callback` 或 `POST /`：消息接收。参数 `msg_signature`、`timestamp`、`nonce`；Body 为包含 `<Encrypt>` 的 XML。
+- `POST /`：消息接收。参数 `msg_signature`、`timestamp`、`nonce`；Body 为包含 `<Encrypt>` 的 XML。
   - 验签并解密消息；日志打印解密后的原始 XML。
   - 若为非事件消息：被动加密回复文本“OK”（标准回包 XML）。
   - 若为事件消息：返回明文 `success`。
@@ -98,6 +97,7 @@ GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
 
 ## 说明
 
+- 使用企业微信官方 Go 实现（`wxbizmsgcrypt.go`）进行验签、解密与回包加密。
 - 加密：AES-256-CBC + PKCS#7，IV 为 AESKey 的前 16 字节（`EncodingAESKey` 解出 32 字节）。
 - 签名：对 `[token, timestamp, nonce, encrypted]` 字典序排序后拼接，做 SHA1。
 - 明文结构：`16B 随机 | 4B 大端长度 | XML 消息 | receiveid`。服务会在提供 `WECOM_RECEIVE_ID` 时进行校验。

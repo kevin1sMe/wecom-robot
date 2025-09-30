@@ -1,27 +1,23 @@
 package server
 
 import (
-	"encoding/xml"
-	"fmt"
-	"log"
-	"math/rand"
-	"net/http"
-	"strconv"
-	"time"
+    "encoding/xml"
+    "fmt"
+    "io"
+    "log"
+    "math/rand"
+    "net/http"
+    "strconv"
+    "time"
 
-	"wecom-robot/internal/wecom"
+    "wecom-robot/internal/wecom"
 )
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
-type encryptedXML struct {
-	XMLName    xml.Name `xml:"xml"`
-	ToUserName string   `xml:"ToUserName"`
-	AgentID    string   `xml:"AgentID"`
-	Encrypt    string   `xml:"Encrypt"`
-}
+// encryptedXML no longer needed; we pass raw body to official decryptor
 
 type receivedMessage struct {
 	XMLName      xml.Name `xml:"xml"`
@@ -33,20 +29,9 @@ type receivedMessage struct {
 	Event        string   `xml:"Event"`
 }
 
-func NewMux(wc *wecom.Crypto) *http.ServeMux {
+func NewMux(wc *wecom.WXBizMsgCrypt) *http.ServeMux {
     mux := http.NewServeMux()
-    mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-        switch r.Method {
-        case http.MethodGet:
-            handleVerify(wc, w, r)
-        case http.MethodPost:
-            handleMessage(wc, w, r)
-        default:
-            w.WriteHeader(http.StatusMethodNotAllowed)
-        }
-    })
-
-    // 支持根路径作为回调 URL（便于直接将域名配置为回调）
+    // 仅使用根路径作为回调 URL
     mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
         // 仅处理精确的根路径，其它子路径交给默认 404
         if r.URL.Path != "/" {
@@ -78,64 +63,49 @@ func NewMux(wc *wecom.Crypto) *http.ServeMux {
     return mux
 }
 
-func handleVerify(wc *wecom.Crypto, w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	signature := q.Get("msg_signature")
-	timestamp := q.Get("timestamp")
-	nonce := q.Get("nonce")
-	echostr := q.Get("echostr")
+func handleVerify(wc *wecom.WXBizMsgCrypt, w http.ResponseWriter, r *http.Request) {
+    q := r.URL.Query()
+    signature := q.Get("msg_signature")
+    timestamp := q.Get("timestamp")
+    nonce := q.Get("nonce")
+    echostr := q.Get("echostr")
 
-	if signature == "" || timestamp == "" || nonce == "" || echostr == "" {
-		http.Error(w, "missing query params", http.StatusBadRequest)
-		return
-	}
-	if !wc.VerifySignature(signature, timestamp, nonce, echostr) {
-		http.Error(w, "invalid signature", http.StatusForbidden)
-		return
-	}
-	msg, err := wc.Decrypt(echostr)
-	if err != nil {
-		http.Error(w, "decrypt echostr failed", http.StatusForbidden)
-		log.Printf("verify decrypt error: %v", err)
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write(msg)
+    if signature == "" || timestamp == "" || nonce == "" || echostr == "" {
+        http.Error(w, "missing query params", http.StatusBadRequest)
+        return
+    }
+    // 使用官方实现进行验签 + 解密
+    msg, cerr := wc.VerifyURL(signature, timestamp, nonce, echostr)
+    if cerr != nil {
+        http.Error(w, "decrypt echostr failed", http.StatusForbidden)
+        log.Printf("verify decrypt error: %s (%d)", cerr.ErrMsg, cerr.ErrCode)
+        return
+    }
+    w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+    _, _ = w.Write(msg)
 }
 
-func handleMessage(wc *wecom.Crypto, w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	signature := q.Get("msg_signature")
-	timestamp := q.Get("timestamp")
-	nonce := q.Get("nonce")
+func handleMessage(wc *wecom.WXBizMsgCrypt, w http.ResponseWriter, r *http.Request) {
+    q := r.URL.Query()
+    signature := q.Get("msg_signature")
+    timestamp := q.Get("timestamp")
+    nonce := q.Get("nonce")
 
-	if signature == "" || timestamp == "" || nonce == "" {
-		http.Error(w, "missing query params", http.StatusBadRequest)
-		return
-	}
+    if signature == "" || timestamp == "" || nonce == "" {
+        http.Error(w, "missing query params", http.StatusBadRequest)
+        return
+    }
 
-	var req encryptedXML
-	decoder := xml.NewDecoder(r.Body)
-	if err := decoder.Decode(&req); err != nil {
-		http.Error(w, "invalid xml", http.StatusBadRequest)
-		return
-	}
-	if req.Encrypt == "" {
-		http.Error(w, "missing Encrypt field", http.StatusBadRequest)
-		return
-	}
-	if !wc.VerifySignature(signature, timestamp, nonce, req.Encrypt) {
-		http.Error(w, "invalid signature", http.StatusForbidden)
-		return
-	}
-	msg, err := wc.Decrypt(req.Encrypt)
-	if err != nil {
-		http.Error(w, "decrypt failed", http.StatusForbidden)
-		log.Printf("decrypt error: %v", err)
-		return
-	}
+    // 读取原始请求体，交给官方实现处理（内含验签、解密、receive_id 校验）
+    body, _ := io.ReadAll(r.Body)
+    msg, cerr := wc.DecryptMsg(signature, timestamp, nonce, body)
+    if cerr != nil {
+        http.Error(w, "decrypt failed", http.StatusForbidden)
+        log.Printf("decrypt error: %s (%d)", cerr.ErrMsg, cerr.ErrCode)
+        return
+    }
 
-	log.Printf("收到解密后的消息: %s", string(msg))
+    log.Printf("收到解密后的消息: %s", string(msg))
 
 	// 尝试解析消息类型；事件类型按标准返回明文 success；非事件回复加密文本 "OK"
 	var rm receivedMessage
@@ -152,25 +122,20 @@ func handleMessage(wc *wecom.Crypto, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 构造被动回复文本消息（OK），并加密回包
-	replyPlain := buildTextReplyXML(rm.FromUserName, rm.ToUserName, "OK")
-	encrypt, err := wc.Encrypt([]byte(replyPlain))
-	if err != nil {
-		log.Printf("encrypt reply failed: %v", err)
-		// 兜底：按标准返回 success
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("success"))
-		return
-	}
-
-	ts := strconv.FormatInt(time.Now().Unix(), 10)
-	replyNonce := randString(16)
-	sig := wc.Sign(ts, replyNonce, encrypt)
-
-	// 标准加密回包 XML
-	resp := fmt.Sprintf("<xml>\n<Encrypt><![CDATA[%s]]></Encrypt>\n<MsgSignature><![CDATA[%s]]></MsgSignature>\n<TimeStamp>%s</TimeStamp>\n<Nonce><![CDATA[%s]]></Nonce>\n</xml>", encrypt, sig, ts, replyNonce)
-	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-	_, _ = w.Write([]byte(resp))
+    // 构造被动回复文本消息（OK），使用官方实现加密并生成标准回包 XML
+    replyPlain := buildTextReplyXML(rm.FromUserName, rm.ToUserName, "OK")
+    ts := strconv.FormatInt(time.Now().Unix(), 10)
+    replyNonce := randString(16)
+    respXML, cerr := wc.EncryptMsg(replyPlain, ts, replyNonce)
+    if cerr != nil {
+        log.Printf("encrypt reply failed: %s (%d)", cerr.ErrMsg, cerr.ErrCode)
+        // 兜底：按标准返回 success
+        w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+        _, _ = w.Write([]byte("success"))
+        return
+    }
+    w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+    _, _ = w.Write(respXML)
 }
 
 func buildTextReplyXML(toUser, fromUser, content string) string {
