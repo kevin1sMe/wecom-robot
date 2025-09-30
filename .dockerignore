@@ -1,0 +1,25 @@
+# Build artifacts and caches
+.gocache
+bin/
+dist/
+
+# Git
+.git
+.gitignore
+
+# IDE/Editor
+.vscode
+.idea
+.history
+
+# Local env/files
+.env
+*.local
+*.log
+*.out
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+

@@ -1,0 +1,25 @@
+# Env files
+.env
+.env.*
+
+# Go build caches and outputs
+.gocache/
+bin/
+dist/
+coverage.*
+*.out
+*.tmp
+*.log
+
+# Binaries
+wecom-robot
+
+# IDE/editor and OS files
+.vscode/
+.idea/
+.history/
+.DS_Store
+Thumbs.db
+
+# Vendor (unused by default)
+vendor/
