@@ -593,18 +593,20 @@ func parseUnixTimestamp(s string) (time.Time, bool) {
 
 // tryReadCache returns cached HTML if found.
 func (p *Processor) tryReadCache(ctx context.Context, url string) (string, bool) {
-	// Prefer Redis if configured
-	if p.rc != nil {
-		key := p.rc.Key("html", hashURL(url))
-		if v, ok, err := p.rc.GetString(ctx, key); err == nil && ok {
-			return v, true
-		}
-	}
-	// Fallback to file cache (if enabled)
-	path := p.cacheFilePath(url)
-	if path == "" {
-		return "", false
-	}
+    // Prefer Redis if configured
+    if p.rc != nil {
+        key := p.rc.Key("html", hashURL(url))
+        if v, ok, err := p.rc.GetString(ctx, key); err == nil && ok {
+            return v, true
+        }
+        // Redis enabled: do not fallback to local file cache
+        return "", false
+    }
+    // Fallback to file cache (if enabled)
+    path := p.cacheFilePath(url)
+    if path == "" {
+        return "", false
+    }
 	b, err := os.ReadFile(path)
 	if err != nil || len(b) == 0 {
 		return "", false
@@ -672,21 +674,23 @@ func sha256Sum(b []byte) string {
 
 // tryReadMetaCache loads a previously computed Readwise body JSON if present
 func (p *Processor) tryReadMetaCache(ctx context.Context, url string) (map[string]any, bool) {
-	// Prefer Redis if configured
-	if p.rc != nil {
-		key := p.rc.Key("body", hashURL(url))
-		if s, ok, err := p.rc.GetString(ctx, key); err == nil && ok && s != "" {
-			var v map[string]any
-			if json.Unmarshal([]byte(s), &v) == nil {
-				return v, true
-			}
-		}
-	}
-	// Fallback to file
-	path := p.cacheMetaFilePath(url)
-	if path == "" {
-		return nil, false
-	}
+    // Prefer Redis if configured
+    if p.rc != nil {
+        key := p.rc.Key("body", hashURL(url))
+        if s, ok, err := p.rc.GetString(ctx, key); err == nil && ok && s != "" {
+            var v map[string]any
+            if json.Unmarshal([]byte(s), &v) == nil {
+                return v, true
+            }
+        }
+        // Redis enabled: do not fallback to local file cache
+        return nil, false
+    }
+    // Fallback to file
+    path := p.cacheMetaFilePath(url)
+    if path == "" {
+        return nil, false
+    }
 	b, err := os.ReadFile(path)
 	if err != nil || len(b) == 0 {
 		return nil, false

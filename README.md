@@ -154,7 +154,7 @@ GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
 - POST `./url` 表单：`url=https://example.com`
 - 行为：与企业微信文本消息中的链接处理一致，后台执行“抓取 → 提取 → 保存”，接口立即返回 `queued`
 - 缓存：若设置 `READER_CACHE_DIR`（默认 `.reader-cache`），会按 URL 的 SHA-256 计算文件名并缓存 HTML，例如：`.reader-cache/<hash>.html`。再次请求相同 URL 将命中缓存并跳过抓取。
-  - 若配置了 `REDIS_ADDR`，将优先使用 Redis 进行缓存与读取（键：`<prefix>:html:<sha256>` 和 `<prefix>:body:<sha256>`），本地文件缓存作为辅助（便于调试/追踪）。
+  - 若配置了 `REDIS_ADDR`，将仅使用 Redis 进行缓存与读取（键：`<prefix>:html:<sha256>` 和 `<prefix>:body:<sha256>`），不再读写本地文件缓存。
 - 追踪日志：若设置 `READER_LOG_DIR`（默认 `.reader-logs`），每次请求会在该目录下创建 `<hash>-<timestamp>/`，包含：
   - `url.txt`、`fetch_source.txt`（cache/mcp）、`fetch.html`
   - `extract_prompt_system.txt`、`extract_prompt_user.txt`、`llm_raw_response.txt`、`extracted.json`
