@@ -155,6 +155,14 @@ GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
   - `url.txt`、`fetch_source.txt`（cache/mcp）、`fetch.html`
   - `extract_prompt_system.txt`、`extract_prompt_user.txt`、`llm_raw_response.txt`、`extracted.json`
   - `readwise_request.json`、`readwise_response_<status>.txt`、遇错时 `error.txt`
+  - 调试日志（step-based）：控制台输出包含 `job=<id> step=<name> event=<start|end|error>` 字段，便于串联异步流程；可按 `job=<id>` 过滤（URL 的 SHA-256 前 8 位）。
+    - 示例：
+      - `[reader] job=ab12cd34 step=process event=start url=https://...`
+      - `[reader] job=ab12cd34 step=fetch_html event=start`
+      - `[reader] job=ab12cd34 step=fetch_html event=end from_cache=false bytes=123456 dur=1.23s`
+      - `[reader] job=ab12cd34 step=extract_meta event=end from_cache=false keys=10 bytes=2048 dur=2.01s`
+      - `[reader] job=ab12cd34 step=save_readwise event=end dur=350ms`
+      - `[reader] job=ab12cd34 step=process event=end url=https://... dur=3.85s`
 - 示例：
 
 ```

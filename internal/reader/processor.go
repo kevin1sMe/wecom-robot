@@ -39,56 +39,75 @@ func NewProcessor(cfg *config.Config) *Processor {
 // ProcessURL runs the full pipeline asynchronously-safe. Logs errors; no panics.
 func (p *Processor) ProcessURL(ctx context.Context, url string) {
 	start := time.Now()
-	log.Printf("[reader] start processing url=%s", url)
+	job := hashURL(url)
+	jobShort := job
+	if len(jobShort) > 8 {
+		jobShort = jobShort[:8]
+	}
 	traceDir := p.makeTraceDir(url)
 	p.traceWrite(traceDir, "url.txt", []byte(strings.TrimSpace(url)))
+	p.traceWrite(traceDir, "job.txt", []byte(jobShort))
 
+	log.Printf("[reader] job=%s step=process event=start url=%s", jobShort, url)
+
+	// Step: fetch HTML
+	stepFetchStart := time.Now()
+	log.Printf("[reader] job=%s step=fetch_html event=start", jobShort)
 	html, fromCache, err := p.fetchHTML(ctx, url)
 	if err != nil {
-		log.Printf("[reader] fetch failed: %v", err)
+		log.Printf("[reader] job=%s step=fetch_html event=error err=%v", jobShort, err)
 		p.traceWrite(traceDir, "error.txt", []byte("fetch: "+err.Error()))
 		return
 	}
 	p.traceWrite(traceDir, "fetch_source.txt", []byte(map[bool]string{true: "cache", false: "mcp"}[fromCache]))
 	p.traceWrite(traceDir, "fetch.html", []byte(html))
-	log.Printf("[reader] fetchHTML succ")
+	log.Printf("[reader] job=%s step=fetch_html event=end from_cache=%t bytes=%d dur=%s", jobShort, fromCache, len(html), time.Since(stepFetchStart))
 
-	// Extract metadata (with internal caching) and receive Readwise-ready body
+	// Step: extract metadata (with internal caching) and receive Readwise-ready body
+	stepExtractStart := time.Now()
+	log.Printf("[reader] job=%s step=extract_meta event=start", jobShort)
 	body, metaFromCache, err := p.extractMetadata(ctx, html, url, traceDir)
 	if err != nil {
-		log.Printf("[reader] extract failed: %v", err)
+		log.Printf("[reader] job=%s step=extract_meta event=error err=%v", jobShort, err)
 		p.traceWrite(traceDir, "error.txt", []byte("extract: "+err.Error()))
 		return
 	}
-	if metaFromCache {
-		log.Printf("[reader] extractMetadata cache hit")
-	} else {
-		log.Printf("[reader] extractMetadata computed")
+	// quick body size for visibility
+	var bodyBytes int
+	if b, _ := json.Marshal(body); len(b) > 0 {
+		bodyBytes = len(b)
 	}
+	log.Printf("[reader] job=%s step=extract_meta event=end from_cache=%t keys=%d bytes=%d dur=%s", jobShort, metaFromCache, len(body), bodyBytes, time.Since(stepExtractStart))
 
+	// Step: save to Readwise
+	stepSaveStart := time.Now()
+	log.Printf("[reader] job=%s step=save_readwise event=start", jobShort)
 	if err := p.saveToReadwise(ctx, body, traceDir); err != nil {
-		log.Printf("[reader] save to readwise failed: %v", err)
+		log.Printf("[reader] job=%s step=save_readwise event=error err=%v", jobShort, err)
 		p.traceWrite(traceDir, "error.txt", []byte("readwise: "+err.Error()))
 		return
 	}
-	log.Printf("[reader] saveToReadwise succ")
+	log.Printf("[reader] job=%s step=save_readwise event=end dur=%s", jobShort, time.Since(stepSaveStart))
 
-	log.Printf("[reader] done url=%s in %s", url, time.Since(start))
+	log.Printf("[reader] job=%s step=process event=end url=%s dur=%s", jobShort, url, time.Since(start))
 }
 
 // fetchHTML fetches content strictly via MCP HTTP server (streamable-http).
 func (p *Processor) fetchHTML(ctx context.Context, url string) (string, bool, error) {
-	url = strings.TrimSpace(url)
-	if p.cfg.MCPHTTPURL == "" {
-		return "", false, errors.New("MCP_HTTP_URL 未配置；本服务仅通过 MCP streamable http 抓取，不支持直接 HTTP")
-	}
-	// Try cache first (testing convenience)
-	if p.cfg.ReaderCacheDir != "" {
-		if cached, ok := p.tryReadCache(url); ok {
-			log.Printf("[reader] cache hit for url=%s", url)
-			return cached, true, nil
-		}
-	}
+    url = strings.TrimSpace(url)
+    if p.cfg.MCPHTTPURL == "" {
+        return "", false, errors.New("MCP_HTTP_URL 未配置；本服务仅通过 MCP streamable http 抓取，不支持直接 HTTP")
+    }
+    // Try cache first (testing convenience)
+    if p.cfg.ReaderCacheDir != "" {
+        if cached, ok := p.tryReadCache(url); ok {
+            log.Printf("[reader] cache hit for url=%s", url)
+            return cached, true, nil
+        }
+        log.Printf("[reader] cache miss for url=%s (dir=%s)", url, strings.TrimSpace(p.cfg.ReaderCacheDir))
+    } else {
+        log.Printf("[reader] cache disabled (READER_CACHE_DIR empty)")
+    }
 
 	html, err := p.fetchViaMCPHTTP(ctx, url)
 	if err != nil {
@@ -98,10 +117,12 @@ func (p *Processor) fetchHTML(ctx context.Context, url string) (string, bool, er
 		return "", false, errors.New("mcp fetch 返回空内容")
 	}
 	// Write cache best-effort
-	if p.cfg.ReaderCacheDir != "" {
-		_ = p.writeCache(url, html)
-	}
-	return html, false, nil
+    if p.cfg.ReaderCacheDir != "" {
+        if err := p.writeCache(url, html); err != nil {
+            log.Printf("[reader] cache write failed: %v", err)
+        }
+    }
+    return html, false, nil
 }
 
 // NOTE: direct HTTP fetching is intentionally disabled per requirements.

@@ -205,17 +205,19 @@ func randString(n int) string {
 
 // firstHTTPURL 提取文本中的第一个 http/https 链接
 func firstHTTPURL(text string) string {
-    s := strings.TrimSpace(text)
-    log.Printf("[DEBUG] firstHTTPURL - 原始文本: '%s'", text)
-    log.Printf("[DEBUG] firstHTTPURL - 去空格后: '%s'", s)
-    // 严格策略：仅当整个内容以 http/https 开头时返回
-    hasPrefix := strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
-    log.Printf("[DEBUG] firstHTTPURL - 前缀判断: %v", hasPrefix)
-    if hasPrefix {
-        return s
-    }
-    // 不再匹配正文中的其他链接位置
-    return ""
+	s := strings.TrimSpace(text)
+	log.Printf("[DEBUG] firstHTTPURL - 原始文本: '%s'", text)
+	log.Printf("[DEBUG] firstHTTPURL - 去空格后: '%s'", s)
+	// 严格策略：仅当整个内容以 http/https 开头时返回
+	hasPrefix := strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+	log.Printf("[DEBUG] firstHTTPURL - 前缀判断: %v", hasPrefix)
+	if hasPrefix {
+		log.Printf("[DEBUG] firstHTTPURL - 返回URL: '%s'", s)
+		return s
+	}
+	log.Printf("[DEBUG] firstHTTPURL - 未返回URL（内容未以 http/https 开头）")
+	// 不再匹配正文中的其他链接位置
+	return ""
 }
 
 // (no-op placeholder removed)
