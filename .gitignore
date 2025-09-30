@@ -23,3 +23,10 @@ Thumbs.db
 
 # Vendor (unused by default)
 vendor/
+
+# Local caches and logs
+.reader-cache/
+.reader-logs/
+
+# Go test binaries
+*.test

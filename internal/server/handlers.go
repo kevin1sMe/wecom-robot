@@ -1,16 +1,21 @@
 package server
 
 import (
-    "encoding/xml"
-    "fmt"
-    "io"
-    "log"
-    "math/rand"
-    "net/http"
-    "strconv"
-    "time"
+	"context"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
 
-    "wecom-robot/internal/wecom"
+	"wecom-robot/internal/config"
+	"wecom-robot/internal/reader"
+	"wecom-robot/internal/wecom"
 )
 
 func init() {
@@ -29,83 +34,106 @@ type receivedMessage struct {
 	Event        string   `xml:"Event"`
 }
 
-func NewMux(wc *wecom.WXBizMsgCrypt) *http.ServeMux {
-    mux := http.NewServeMux()
-    // 仅使用根路径作为回调 URL
-    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-        // 仅处理精确的根路径，其它子路径交给默认 404
-        if r.URL.Path != "/" {
-            http.NotFound(w, r)
-            return
-        }
-        switch r.Method {
-        case http.MethodGet:
-            // 若包含验签参数则执行 URL 验证，否则返回健康检查 OK
-            q := r.URL.Query()
-            if q.Get("msg_signature") != "" && q.Get("timestamp") != "" && q.Get("nonce") != "" && q.Get("echostr") != "" {
-                handleVerify(wc, w, r)
-                return
-            }
-            w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-            _, _ = w.Write([]byte("ok"))
-        case http.MethodPost:
-            // 若包含消息签名参数则处理消息，否则提示缺少参数
-            q := r.URL.Query()
-            if q.Get("msg_signature") != "" && q.Get("timestamp") != "" && q.Get("nonce") != "" {
-                handleMessage(wc, w, r)
-                return
-            }
-            http.Error(w, "missing query params", http.StatusBadRequest)
-        default:
-            w.WriteHeader(http.StatusMethodNotAllowed)
-        }
-    })
-    return mux
+func NewMux(cfg *config.Config, wc *wecom.WXBizMsgCrypt) *http.ServeMux {
+	mux := http.NewServeMux()
+	proc := reader.NewProcessor(cfg)
+	// Testing helper: POST /url with form field "url" to trigger the same
+	// pipeline as WeCom text message link handling.
+	mux.HandleFunc("/url", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "invalid form", http.StatusBadRequest)
+			return
+		}
+		url := strings.TrimSpace(r.FormValue("url"))
+		if url == "" || (!strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://")) {
+			http.Error(w, "missing or invalid url", http.StatusBadRequest)
+			return
+		}
+		log.Printf("[/url] received url=%s", url)
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+		go func() { defer cancel(); proc.ProcessURL(ctx, url) }()
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("queued"))
+	})
+	// 仅使用根路径作为回调 URL
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// 仅处理精确的根路径，其它子路径交给默认 404
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			// 若包含验签参数则执行 URL 验证，否则返回健康检查 OK
+			q := r.URL.Query()
+			if q.Get("msg_signature") != "" && q.Get("timestamp") != "" && q.Get("nonce") != "" && q.Get("echostr") != "" {
+				handleVerify(wc, w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = w.Write([]byte("ok"))
+		case http.MethodPost:
+			// 若包含消息签名参数则处理消息，否则提示缺少参数
+			q := r.URL.Query()
+			if q.Get("msg_signature") != "" && q.Get("timestamp") != "" && q.Get("nonce") != "" {
+				handleMessage(cfg, proc, wc, w, r)
+				return
+			}
+			http.Error(w, "missing query params", http.StatusBadRequest)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+	return mux
 }
 
 func handleVerify(wc *wecom.WXBizMsgCrypt, w http.ResponseWriter, r *http.Request) {
-    q := r.URL.Query()
-    signature := q.Get("msg_signature")
-    timestamp := q.Get("timestamp")
-    nonce := q.Get("nonce")
-    echostr := q.Get("echostr")
+	q := r.URL.Query()
+	signature := q.Get("msg_signature")
+	timestamp := q.Get("timestamp")
+	nonce := q.Get("nonce")
+	echostr := q.Get("echostr")
 
-    if signature == "" || timestamp == "" || nonce == "" || echostr == "" {
-        http.Error(w, "missing query params", http.StatusBadRequest)
-        return
-    }
-    // 使用官方实现进行验签 + 解密
-    msg, cerr := wc.VerifyURL(signature, timestamp, nonce, echostr)
-    if cerr != nil {
-        http.Error(w, "decrypt echostr failed", http.StatusForbidden)
-        log.Printf("verify decrypt error: %s (%d)", cerr.ErrMsg, cerr.ErrCode)
-        return
-    }
-    w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-    _, _ = w.Write(msg)
+	if signature == "" || timestamp == "" || nonce == "" || echostr == "" {
+		http.Error(w, "missing query params", http.StatusBadRequest)
+		return
+	}
+	// 使用官方实现进行验签 + 解密
+	msg, cerr := wc.VerifyURL(signature, timestamp, nonce, echostr)
+	if cerr != nil {
+		http.Error(w, "decrypt echostr failed", http.StatusForbidden)
+		log.Printf("verify decrypt error: %s (%d)", cerr.ErrMsg, cerr.ErrCode)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write(msg)
 }
 
-func handleMessage(wc *wecom.WXBizMsgCrypt, w http.ResponseWriter, r *http.Request) {
-    q := r.URL.Query()
-    signature := q.Get("msg_signature")
-    timestamp := q.Get("timestamp")
-    nonce := q.Get("nonce")
+func handleMessage(cfg *config.Config, proc *reader.Processor, wc *wecom.WXBizMsgCrypt, w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	signature := q.Get("msg_signature")
+	timestamp := q.Get("timestamp")
+	nonce := q.Get("nonce")
 
-    if signature == "" || timestamp == "" || nonce == "" {
-        http.Error(w, "missing query params", http.StatusBadRequest)
-        return
-    }
+	if signature == "" || timestamp == "" || nonce == "" {
+		http.Error(w, "missing query params", http.StatusBadRequest)
+		return
+	}
 
-    // 读取原始请求体，交给官方实现处理（内含验签、解密、receive_id 校验）
-    body, _ := io.ReadAll(r.Body)
-    msg, cerr := wc.DecryptMsg(signature, timestamp, nonce, body)
-    if cerr != nil {
-        http.Error(w, "decrypt failed", http.StatusForbidden)
-        log.Printf("decrypt error: %s (%d)", cerr.ErrMsg, cerr.ErrCode)
-        return
-    }
+	// 读取原始请求体，交给官方实现处理（内含验签、解密、receive_id 校验）
+	body, _ := io.ReadAll(r.Body)
+	msg, cerr := wc.DecryptMsg(signature, timestamp, nonce, body)
+	if cerr != nil {
+		http.Error(w, "decrypt failed", http.StatusForbidden)
+		log.Printf("decrypt error: %s (%d)", cerr.ErrMsg, cerr.ErrCode)
+		return
+	}
 
-    log.Printf("收到解密后的消息: %s", string(msg))
+	log.Printf("收到解密后的消息: %s", string(msg))
 
 	// 尝试解析消息类型；事件类型按标准返回明文 success；非事件回复加密文本 "OK"
 	var rm receivedMessage
@@ -122,20 +150,28 @@ func handleMessage(wc *wecom.WXBizMsgCrypt, w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-    // 构造被动回复文本消息（OK），使用官方实现加密并生成标准回包 XML
-    replyPlain := buildTextReplyXML(rm.FromUserName, rm.ToUserName, "OK")
-    ts := strconv.FormatInt(time.Now().Unix(), 10)
-    replyNonce := randString(16)
-    respXML, cerr := wc.EncryptMsg(replyPlain, ts, replyNonce)
-    if cerr != nil {
-        log.Printf("encrypt reply failed: %s (%d)", cerr.ErrMsg, cerr.ErrCode)
-        // 兜底：按标准返回 success
-        w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-        _, _ = w.Write([]byte("success"))
-        return
-    }
-    w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-    _, _ = w.Write(respXML)
+	// 如果是文本消息并且包含 http/https 链接，则异步触发 Go 处理流水线
+	if rm.MsgType == "text" {
+		if url := firstHTTPURL(rm.Content); url != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			go func() { defer cancel(); proc.ProcessURL(ctx, url) }()
+		}
+	}
+
+	// 构造被动回复文本消息（OK），使用官方实现加密并生成标准回包 XML
+	replyPlain := buildTextReplyXML(rm.FromUserName, rm.ToUserName, "OK")
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	replyNonce := randString(16)
+	respXML, cerr := wc.EncryptMsg(replyPlain, ts, replyNonce)
+	if cerr != nil {
+		log.Printf("encrypt reply failed: %s (%d)", cerr.ErrMsg, cerr.ErrCode)
+		// 兜底：按标准返回 success
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = w.Write([]byte("success"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+	_, _ = w.Write(respXML)
 }
 
 func buildTextReplyXML(toUser, fromUser, content string) string {
@@ -151,3 +187,18 @@ func randString(n int) string {
 	}
 	return string(b)
 }
+
+// firstHTTPURL 提取文本中的第一个 http/https 链接
+func firstHTTPURL(text string) string {
+	s := strings.TrimSpace(text)
+	// 快速路径：整个内容就是链接
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return s
+	}
+	// 在文本中匹配第一个 http/https 链接
+	re := regexp.MustCompile(`https?://\S+`)
+	m := re.FindString(s)
+	return m
+}
+
+// (no-op placeholder removed)

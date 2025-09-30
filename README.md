@@ -98,6 +98,64 @@ GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
 ## 说明
 
 - 使用企业微信官方 Go 实现（`wxbizmsgcrypt.go`）进行验签、解密与回包加密。
+- 元数据提取使用官方 OpenAI Go SDK（`github.com/openai/openai-go`），支持自定义 `LLM_BASE_URL`。
 - 加密：AES-256-CBC + PKCS#7，IV 为 AESKey 的前 16 字节（`EncodingAESKey` 解出 32 字节）。
 - 签名：对 `[token, timestamp, nonce, encrypted]` 字典序排序后拼接，做 SHA1。
 - 明文结构：`16B 随机 | 4B 大端长度 | XML 消息 | receiveid`。服务会在提供 `WECOM_RECEIVE_ID` 时进行校验。
+
+## 链接到 Readwise（Go 内置集成）
+
+当接收到文本消息且内容包含 `http://` 或 `https://` 链接时，服务会在后台执行“抓取 → 提取 → 保存”流水线：
+
+- 抓取：通过 MCP `streamablehttp`（或兼容）服务器获取原始 HTML（不进行直接 HTTP 抓取）
+- 提取：调用 OpenAI 兼容 Chat Completions 模型，输出严格 JSON 的元数据
+- 保存：调用 Readwise Reader API `/api/v3/save/`
+
+主回包不受影响（事件：明文 `success`；文本：加密回复 `OK`），流水线异步执行，避免企业微信重试。
+
+必需/可选环境变量：
+- WeCom：`WECOM_TOKEN`、`WECOM_ENCODING_AES_KEY`、`WECOM_RECEIVE_ID`、`PORT`（可选）
+- LLM：`LLM_BASE_URL`（例如官方为 `https://api.openai.com/v1`）、`LLM_API_KEY`、`LLM_MODEL`（也兼容 `EXAMPLE_BASE_URL`、`EXAMPLE_API_KEY`、`EXAMPLE_MODEL_NAME`）
+- Readwise：`READWISE_API_TOKEN`
+- MCP（必需）：
+  - `MCP_HTTP_URL`（你的 MCP HTTP 端点，例如 `http://localhost:8080/mcp`）
+  - `MCP_TOOL_NAME`（默认 `http`）
+- 缓存（可选）：
+  - `READER_CACHE_DIR`（抓取结果本地缓存目录，默认 `.reader-cache`）
+ - 追踪日志（可选）：
+   - `READER_LOG_DIR`（每次处理的上下文落盘目录，默认 `.reader-logs`）
+
+快速运行示例：
+
+```sh
+export WECOM_TOKEN=your_token
+export WECOM_ENCODING_AES_KEY=your_43_char_key
+export WECOM_RECEIVE_ID=your_corp_id_or_suite_id
+
+export LLM_BASE_URL=https://api.openai.com/v1  # 或你的 OpenAI 兼容端点
+export LLM_API_KEY=sk-xxx
+export LLM_MODEL=gpt-4o-mini
+export READWISE_API_TOKEN=rw_XXX
+
+# MCP streamable HTTP（必需）
+export MCP_HTTP_URL=http://localhost:8080/mcp
+
+GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
+
+### 本地测试入口（非 WeCom）
+
+- POST `./url` 表单：`url=https://example.com`
+- 行为：与企业微信文本消息中的链接处理一致，后台执行“抓取 → 提取 → 保存”，接口立即返回 `queued`
+- 缓存：若设置 `READER_CACHE_DIR`（默认 `.reader-cache`），会按 URL 的 SHA-256 计算文件名并缓存 HTML，例如：`.reader-cache/<hash>.html`。再次请求相同 URL 将命中缓存并跳过抓取。
+- 追踪日志：若设置 `READER_LOG_DIR`（默认 `.reader-logs`），每次请求会在该目录下创建 `<hash>-<timestamp>/`，包含：
+  - `url.txt`、`fetch_source.txt`（cache/mcp）、`fetch.html`
+  - `extract_prompt_system.txt`、`extract_prompt_user.txt`、`llm_raw_response.txt`、`extracted.json`
+  - `readwise_request.json`、`readwise_response_<status>.txt`、遇错时 `error.txt`
+- 示例：
+
+```
+curl -X POST http://localhost:8080/url \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'url=https://mp.weixin.qq.com/s/R5t8xJW1CnjJjZoeOgX_Rg'
+```
+```

@@ -1,12 +1,12 @@
 package main
 
 import (
-    "log"
-    "net/http"
+	"log"
+	"net/http"
 
-    "wecom-robot/internal/config"
-    "wecom-robot/internal/server"
-    "wecom-robot/internal/wecom"
+	"wecom-robot/internal/config"
+	"wecom-robot/internal/server"
+	"wecom-robot/internal/wecom"
 )
 
 func main() {
@@ -15,9 +15,9 @@ func main() {
 		log.Fatalf("配置错误: %v", err)
 	}
 
-    wc := wecom.NewWXBizMsgCrypt(cfg.Token, cfg.EncodingAESKey, cfg.ReceiveID, wecom.XmlType)
+	wc := wecom.NewWXBizMsgCrypt(cfg.Token, cfg.EncodingAESKey, cfg.ReceiveID, wecom.XmlType)
 
-    mux := server.NewMux(wc)
+	mux := server.NewMux(cfg, wc)
 
 	addr := ":" + cfg.Port
 	log.Printf("WeCom 回调服务已启动, 监听 %s", addr)
