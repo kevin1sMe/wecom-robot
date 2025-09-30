@@ -1,20 +1,16 @@
 package mcpclient
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"strings"
-	"time"
+    "context"
+    "encoding/json"
+    "errors"
+    "fmt"
+    "strings"
 
-	mcpclient "github.com/mark3labs/mcp-go/client"
-	"github.com/mark3labs/mcp-go/client/transport"
-	mcp "github.com/mark3labs/mcp-go/mcp"
-)
-
-const (
-	MCP_TIMEOUT_SECOND = 2 * 60 * time.Second
+    mcpclient "github.com/mark3labs/mcp-go/client"
+    "github.com/mark3labs/mcp-go/client/transport"
+    mcp "github.com/mark3labs/mcp-go/mcp"
+    "wecom-robot/internal/params"
 )
 
 // Client wraps an MCP HTTP endpoint and a tool name (default "http").
@@ -36,17 +32,17 @@ func (c *Client) FetchURL(ctx context.Context, url string) (string, error) {
 	if c.Endpoint == "" {
 		return "", errors.New("empty MCP endpoint")
 	}
-	trans, err := transport.NewStreamableHTTP(c.Endpoint, transport.WithHTTPTimeout(MCP_TIMEOUT_SECOND))
+    trans, err := transport.NewStreamableHTTP(c.Endpoint, transport.WithHTTPTimeout(params.MCPTransportTimeout))
 	if err != nil {
 		return "", fmt.Errorf("new streamable http: %w", err)
 	}
 	cli := mcpclient.NewClient(trans)
 	// ensure we have a reasonable timeout if caller didn't set one
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, MCP_TIMEOUT_SECOND)
-		defer cancel()
-	}
+    if _, ok := ctx.Deadline(); !ok {
+        var cancel context.CancelFunc
+        ctx, cancel = context.WithTimeout(ctx, params.StepTimeout)
+        defer cancel()
+    }
 	if err := cli.Start(ctx); err != nil {
 		return "", fmt.Errorf("mcp start: %w", err)
 	}

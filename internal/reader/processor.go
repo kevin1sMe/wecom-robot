@@ -18,6 +18,7 @@ import (
 	"wecom-robot/internal/cache"
 	"wecom-robot/internal/config"
 	"wecom-robot/internal/mcpclient"
+	"wecom-robot/internal/params"
 
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -34,7 +35,7 @@ type Processor struct {
 func NewProcessor(cfg *config.Config) *Processor {
 	p := &Processor{
 		cfg: cfg,
-		hc:  &http.Client{Timeout: 30 * time.Second},
+		hc:  &http.Client{Timeout: params.HTTPClientTimeout},
 	}
 	// Optional Redis cache
 	if strings.TrimSpace(cfg.RedisAddr) != "" {
@@ -58,10 +59,12 @@ func (p *Processor) ProcessURL(ctx context.Context, url string) {
 
 	log.Printf("[reader] job=%s step=process event=start url=%s", jobShort, url)
 
-	// Step: fetch HTML
+	// Step: fetch HTML (<= 5m)
 	stepFetchStart := time.Now()
 	log.Printf("[reader] job=%s step=fetch_html event=start", jobShort)
-	html, fromCache, err := p.fetchHTML(ctx, url)
+	ctxFetch, cancelFetch := context.WithTimeout(ctx, params.StepTimeout)
+	html, fromCache, err := p.fetchHTML(ctxFetch, url)
+	cancelFetch()
 	if err != nil {
 		log.Printf("[reader] job=%s step=fetch_html event=error err=%v", jobShort, err)
 		p.traceWrite(traceDir, "error.txt", []byte("fetch: "+err.Error()))
@@ -71,10 +74,12 @@ func (p *Processor) ProcessURL(ctx context.Context, url string) {
 	p.traceWrite(traceDir, "fetch.html", []byte(html))
 	log.Printf("[reader] job=%s step=fetch_html event=end from_cache=%t bytes=%d dur=%s", jobShort, fromCache, len(html), time.Since(stepFetchStart))
 
-	// Step: extract metadata (with internal caching) and receive Readwise-ready body
+	// Step: extract metadata (<= 5m) and receive Readwise-ready body
 	stepExtractStart := time.Now()
 	log.Printf("[reader] job=%s step=extract_meta event=start", jobShort)
-	body, metaFromCache, err := p.extractMetadata(ctx, html, url, traceDir)
+	ctxExtract, cancelExtract := context.WithTimeout(ctx, params.StepTimeout)
+	body, metaFromCache, err := p.extractMetadata(ctxExtract, html, url, traceDir)
+	cancelExtract()
 	if err != nil {
 		log.Printf("[reader] job=%s step=extract_meta event=error err=%v", jobShort, err)
 		p.traceWrite(traceDir, "error.txt", []byte("extract: "+err.Error()))
@@ -87,14 +92,16 @@ func (p *Processor) ProcessURL(ctx context.Context, url string) {
 	}
 	log.Printf("[reader] job=%s step=extract_meta event=end from_cache=%t keys=%d bytes=%d dur=%s", jobShort, metaFromCache, len(body), bodyBytes, time.Since(stepExtractStart))
 
-	// Step: save to Readwise
+	// Step: save to Readwise (<= 5m)
 	stepSaveStart := time.Now()
 	log.Printf("[reader] job=%s step=save_readwise event=start", jobShort)
-	if err := p.saveToReadwise(ctx, body, traceDir); err != nil {
+	ctxSave, cancelSave := context.WithTimeout(ctx, params.StepTimeout)
+	if err := p.saveToReadwise(ctxSave, body, traceDir); err != nil {
 		log.Printf("[reader] job=%s step=save_readwise event=error err=%v", jobShort, err)
 		p.traceWrite(traceDir, "error.txt", []byte("readwise: "+err.Error()))
 		return
 	}
+	cancelSave()
 	log.Printf("[reader] job=%s step=save_readwise event=end dur=%s", jobShort, time.Since(stepSaveStart))
 
 	log.Printf("[reader] job=%s step=process event=end url=%s dur=%s", jobShort, url, time.Since(start))

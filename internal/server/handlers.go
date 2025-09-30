@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"wecom-robot/internal/config"
+	"wecom-robot/internal/params"
 	"wecom-robot/internal/reader"
 	"wecom-robot/internal/wecom"
 )
@@ -53,7 +54,7 @@ func NewMux(cfg *config.Config, wc *wecom.WXBizMsgCrypt) *http.ServeMux {
 			return
 		}
 		log.Printf("[/url] received url=%s", url)
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), params.PipelineTimeout)
 		go func() { defer cancel(); proc.ProcessURL(ctx, url) }()
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("queued"))
@@ -164,7 +165,7 @@ func handleMessage(cfg *config.Config, proc *reader.Processor, wc *wecom.WXBizMs
 		log.Printf("[DEBUG] URL 触发策略: 仅当 Content 以 http/https 开头 时才触发; Content(trim)='%s'", preview)
 		if url := firstHTTPURL(rm.Content); url != "" {
 			log.Printf("[DEBUG] 发现URL: %s，开始异步处理", url)
-			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+			ctx, cancel := context.WithTimeout(context.Background(), params.PipelineTimeout)
 			go func() { defer cancel(); proc.ProcessURL(ctx, url) }()
 		} else {
 			log.Printf("[DEBUG] 文本消息中未触发URL处理（未以 http/https 开头或为空）")
@@ -206,16 +207,11 @@ func randString(n int) string {
 // firstHTTPURL 提取文本中的第一个 http/https 链接
 func firstHTTPURL(text string) string {
 	s := strings.TrimSpace(text)
-	log.Printf("[DEBUG] firstHTTPURL - 原始文本: '%s'", text)
-	log.Printf("[DEBUG] firstHTTPURL - 去空格后: '%s'", s)
 	// 严格策略：仅当整个内容以 http/https 开头时返回
 	hasPrefix := strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
-	log.Printf("[DEBUG] firstHTTPURL - 前缀判断: %v", hasPrefix)
 	if hasPrefix {
-		log.Printf("[DEBUG] firstHTTPURL - 返回URL: '%s'", s)
 		return s
 	}
-	log.Printf("[DEBUG] firstHTTPURL - 未返回URL（内容未以 http/https 开头）")
 	// 不再匹配正文中的其他链接位置
 	return ""
 }
