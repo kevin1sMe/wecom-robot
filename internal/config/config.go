@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"os"
+	"strconv"
 )
 
 type Config struct {
@@ -14,6 +15,8 @@ type Config struct {
 	LLMBaseURL string
 	LLMAPIKey  string
 	LLMModel   string
+	// Optional: if nil, do not send temperature param (lets provider default)
+	LLMTemperature *float64
 
 	// MCP HTTP server (streamable-http) for fetching
 	MCPHTTPURL  string // e.g., http://localhost:8080/mcp
@@ -44,6 +47,12 @@ func FromEnv() (*Config, error) {
 		ReadwiseToken:  os.Getenv("READWISE_API_TOKEN"),
 		ReaderCacheDir: os.Getenv("READER_CACHE_DIR"),
 		ReaderLogDir:   os.Getenv("READER_LOG_DIR"),
+	}
+	// Optional temperature; if unset or invalid, keep nil to avoid sending the param
+	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {
+		if f64, err := strconv.ParseFloat(v, 64); err == nil {
+			cfg.LLMTemperature = &f64
+		}
 	}
 	if cfg.Port == "" {
 		cfg.Port = "8080"

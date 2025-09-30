@@ -116,6 +116,7 @@ GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
 必需/可选环境变量：
 - WeCom：`WECOM_TOKEN`、`WECOM_ENCODING_AES_KEY`、`WECOM_RECEIVE_ID`、`PORT`（可选）
 - LLM：`LLM_BASE_URL`（例如官方为 `https://api.openai.com/v1`）、`LLM_API_KEY`、`LLM_MODEL`（也兼容 `EXAMPLE_BASE_URL`、`EXAMPLE_API_KEY`、`EXAMPLE_MODEL_NAME`）
+- LLM 可选参数：`LLM_TEMPERATURE`（不设置则不传该参数，使用模型默认值；如某些 Azure 模型组仅支持默认温度，建议留空或设为 `1`）
 - Readwise：`READWISE_API_TOKEN`
 - MCP（必需）：
   - `MCP_HTTP_URL`（你的 MCP HTTP 端点，例如 `http://localhost:8080/mcp`）
@@ -135,6 +136,9 @@ export WECOM_RECEIVE_ID=your_corp_id_or_suite_id
 export LLM_BASE_URL=https://api.openai.com/v1  # 或你的 OpenAI 兼容端点
 export LLM_API_KEY=sk-xxx
 export LLM_MODEL=gpt-4o-mini
+# 可选：如使用 Azure 某些模型组（如 azure/gpt-5-mini）且其仅支持默认温度，建议不设置该变量；
+# 若确需设置请用 1
+# export LLM_TEMPERATURE=1
 export READWISE_API_TOKEN=rw_XXX
 
 # MCP streamable HTTP（必需）

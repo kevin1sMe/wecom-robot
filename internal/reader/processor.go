@@ -146,14 +146,21 @@ func (p *Processor) extractMetadata(ctx context.Context, html, url, traceDir str
 	}
 	client := openai.NewClient(opts...)
 
-	resp, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
-		Model:       shared.ChatModel(p.cfg.LLMModel),
-		Temperature: openai.Float(0.2),
+	params := openai.ChatCompletionNewParams{
+		Model: shared.ChatModel(p.cfg.LLMModel),
 		Messages: []openai.ChatCompletionMessageParamUnion{
 			openai.SystemMessage(systemPrompt),
 			openai.UserMessage(userPrompt),
 		},
-	})
+	}
+	// Some providers/models (e.g. certain Azure model groups) only support default temperature.
+	// Only set Temperature if configured via env to avoid 400s like
+	// "Unsupported value: 'temperature' does not support 0.2 with this model".
+	if p.cfg.LLMTemperature != nil {
+		params.Temperature = openai.Float(*p.cfg.LLMTemperature)
+	}
+
+	resp, err := client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		return nil, false, fmt.Errorf("llm request: %w", err)
 	}
