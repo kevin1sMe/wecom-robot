@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"wecom-robot/internal/cache"
 	"wecom-robot/internal/config"
 	"wecom-robot/internal/mcpclient"
 
@@ -27,13 +28,20 @@ import (
 type Processor struct {
 	cfg *config.Config
 	hc  *http.Client
+	rc  *cache.Redis
 }
 
 func NewProcessor(cfg *config.Config) *Processor {
-	return &Processor{
+	p := &Processor{
 		cfg: cfg,
 		hc:  &http.Client{Timeout: 30 * time.Second},
 	}
+	// Optional Redis cache
+	if strings.TrimSpace(cfg.RedisAddr) != "" {
+		ttl := time.Duration(cfg.RedisTTLSeconds) * time.Second
+		p.rc = cache.NewRedis(cfg.RedisAddr, cfg.RedisPrefix, ttl)
+	}
+	return p
 }
 
 // ProcessURL runs the full pipeline asynchronously-safe. Logs errors; no panics.
@@ -94,20 +102,16 @@ func (p *Processor) ProcessURL(ctx context.Context, url string) {
 
 // fetchHTML fetches content strictly via MCP HTTP server (streamable-http).
 func (p *Processor) fetchHTML(ctx context.Context, url string) (string, bool, error) {
-    url = strings.TrimSpace(url)
-    if p.cfg.MCPHTTPURL == "" {
-        return "", false, errors.New("MCP_HTTP_URL 未配置；本服务仅通过 MCP streamable http 抓取，不支持直接 HTTP")
-    }
-    // Try cache first (testing convenience)
-    if p.cfg.ReaderCacheDir != "" {
-        if cached, ok := p.tryReadCache(url); ok {
-            log.Printf("[reader] cache hit for url=%s", url)
-            return cached, true, nil
-        }
-        log.Printf("[reader] cache miss for url=%s (dir=%s)", url, strings.TrimSpace(p.cfg.ReaderCacheDir))
-    } else {
-        log.Printf("[reader] cache disabled (READER_CACHE_DIR empty)")
-    }
+	url = strings.TrimSpace(url)
+	if p.cfg.MCPHTTPURL == "" {
+		return "", false, errors.New("MCP_HTTP_URL 未配置；本服务仅通过 MCP streamable http 抓取，不支持直接 HTTP")
+	}
+	// Try Redis/file cache first
+	if cached, ok := p.tryReadCache(ctx, url); ok {
+		log.Printf("[reader] cache hit for url=%s", url)
+		return cached, true, nil
+	}
+	log.Printf("[reader] cache miss for url=%s", url)
 
 	html, err := p.fetchViaMCPHTTP(ctx, url)
 	if err != nil {
@@ -116,13 +120,11 @@ func (p *Processor) fetchHTML(ctx context.Context, url string) (string, bool, er
 	if html == "" {
 		return "", false, errors.New("mcp fetch 返回空内容")
 	}
-	// Write cache best-effort
-    if p.cfg.ReaderCacheDir != "" {
-        if err := p.writeCache(url, html); err != nil {
-            log.Printf("[reader] cache write failed: %v", err)
-        }
-    }
-    return html, false, nil
+	// Write cache best-effort (Redis then file)
+	if err := p.writeCache(ctx, url, html); err != nil {
+		log.Printf("[reader] cache write failed: %v", err)
+	}
+	return html, false, nil
 }
 
 // NOTE: direct HTTP fetching is intentionally disabled per requirements.
@@ -153,7 +155,7 @@ func (p *Processor) extractMetadata(ctx context.Context, html, url, traceDir str
 	p.traceWrite(traceDir, "extract_prompt_user.txt", []byte(userPrompt))
 
 	// Try body cache first
-	if cached, ok := p.tryReadMetaCache(url); ok {
+	if cached, ok := p.tryReadMetaCache(ctx, url); ok {
 		if b, _ := json.MarshalIndent(cached, "", "  "); len(b) > 0 {
 			p.traceWrite(traceDir, "extracted_cached.json", b)
 		}
@@ -208,7 +210,7 @@ func (p *Processor) extractMetadata(ctx context.Context, html, url, traceDir str
 	if b, _ := json.MarshalIndent(body, "", "  "); len(b) > 0 {
 		p.traceWrite(traceDir, "extracted_body.json", b)
 	}
-	_ = p.writeMetaCache(url, body)
+	_ = p.writeMetaCache(ctx, url, body)
 	return body, false, nil
 }
 
@@ -583,23 +585,36 @@ func parseUnixTimestamp(s string) (time.Time, bool) {
 }
 
 // tryReadCache returns cached HTML if found.
-func (p *Processor) tryReadCache(url string) (string, bool) {
+func (p *Processor) tryReadCache(ctx context.Context, url string) (string, bool) {
+	// Prefer Redis if configured
+	if p.rc != nil {
+		key := p.rc.Key("html", hashURL(url))
+		if v, ok, err := p.rc.GetString(ctx, key); err == nil && ok {
+			return v, true
+		}
+	}
+	// Fallback to file cache (if enabled)
 	path := p.cacheFilePath(url)
 	if path == "" {
 		return "", false
 	}
 	b, err := os.ReadFile(path)
-	if err != nil {
-		return "", false
-	}
-	if len(b) == 0 {
+	if err != nil || len(b) == 0 {
 		return "", false
 	}
 	return string(b), true
 }
 
 // writeCache saves HTML to cache file (best-effort).
-func (p *Processor) writeCache(url, html string) error {
+func (p *Processor) writeCache(ctx context.Context, url, html string) error {
+	// Write to Redis if configured
+	if p.rc != nil {
+		key := p.rc.Key("html", hashURL(url))
+		if err := p.rc.SetString(ctx, key, html); err != nil {
+			log.Printf("[reader] redis set error: %v", err)
+		}
+	}
+	// Also write to local file cache when enabled (keeps debug traceability)
 	path := p.cacheFilePath(url)
 	if path == "" {
 		return nil
@@ -646,7 +661,18 @@ func sha256Sum(b []byte) string {
 }
 
 // tryReadMetaCache loads a previously computed Readwise body JSON if present
-func (p *Processor) tryReadMetaCache(url string) (map[string]any, bool) {
+func (p *Processor) tryReadMetaCache(ctx context.Context, url string) (map[string]any, bool) {
+	// Prefer Redis if configured
+	if p.rc != nil {
+		key := p.rc.Key("body", hashURL(url))
+		if s, ok, err := p.rc.GetString(ctx, key); err == nil && ok && s != "" {
+			var v map[string]any
+			if json.Unmarshal([]byte(s), &v) == nil {
+				return v, true
+			}
+		}
+	}
+	// Fallback to file
 	path := p.cacheMetaFilePath(url)
 	if path == "" {
 		return nil, false
@@ -662,7 +688,17 @@ func (p *Processor) tryReadMetaCache(url string) (map[string]any, bool) {
 	return v, true
 }
 
-func (p *Processor) writeMetaCache(url string, body map[string]any) error {
+func (p *Processor) writeMetaCache(ctx context.Context, url string, body map[string]any) error {
+	// Marshal once for both Redis and file
+	b, _ := json.MarshalIndent(body, "", "  ")
+	// Redis
+	if p.rc != nil {
+		key := p.rc.Key("body", hashURL(url))
+		if err := p.rc.SetString(ctx, key, string(b)); err != nil {
+			log.Printf("[reader] redis set body error: %v", err)
+		}
+	}
+	// File
 	path := p.cacheMetaFilePath(url)
 	if path == "" {
 		return nil
@@ -670,7 +706,6 @@ func (p *Processor) writeMetaCache(url string, body map[string]any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	b, _ := json.MarshalIndent(body, "", "  ")
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err

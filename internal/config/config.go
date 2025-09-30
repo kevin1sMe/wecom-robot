@@ -30,6 +30,11 @@ type Config struct {
 
 	// Optional trace logs per URL processing (testing convenience)
 	ReaderLogDir string // env: READER_LOG_DIR (default .reader-logs)
+
+	// Optional Redis cache for fetched HTML/metadata
+	RedisAddr       string // env: REDIS_ADDR (e.g., 127.0.0.1:6379 or redis://user:pass@host:6379/0)
+	RedisPrefix     string // env: REDIS_PREFIX (default: wecom-robot)
+	RedisTTLSeconds int    // env: REDIS_TTL_SECONDS (default: 86400)
 }
 
 func FromEnv() (*Config, error) {
@@ -47,6 +52,8 @@ func FromEnv() (*Config, error) {
 		ReadwiseToken:  os.Getenv("READWISE_API_TOKEN"),
 		ReaderCacheDir: os.Getenv("READER_CACHE_DIR"),
 		ReaderLogDir:   os.Getenv("READER_LOG_DIR"),
+		RedisAddr:      os.Getenv("REDIS_ADDR"),
+		RedisPrefix:    os.Getenv("REDIS_PREFIX"),
 	}
 	// Optional temperature; if unset or invalid, keep nil to avoid sending the param
 	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {
@@ -65,6 +72,18 @@ func FromEnv() (*Config, error) {
 	}
 	if cfg.ReaderLogDir == "" {
 		cfg.ReaderLogDir = ".reader-logs"
+	}
+	if cfg.RedisPrefix == "" {
+		cfg.RedisPrefix = "wecom-robot"
+	}
+	// TTL default: 24h if not set or invalid
+	if v := os.Getenv("REDIS_TTL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.RedisTTLSeconds = n
+		}
+	}
+	if cfg.RedisTTLSeconds == 0 {
+		cfg.RedisTTLSeconds = 86400
 	}
 	if cfg.Token == "" || cfg.EncodingAESKey == "" {
 		return nil, errors.New("必须设置 WECOM_TOKEN 与 WECOM_ENCODING_AES_KEY")
