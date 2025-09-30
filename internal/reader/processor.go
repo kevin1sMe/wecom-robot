@@ -43,34 +43,34 @@ func (p *Processor) ProcessURL(ctx context.Context, url string) {
 	traceDir := p.makeTraceDir(url)
 	p.traceWrite(traceDir, "url.txt", []byte(strings.TrimSpace(url)))
 
-    html, fromCache, err := p.fetchHTML(ctx, url)
-    if err != nil {
-        log.Printf("[reader] fetch failed: %v", err)
-        p.traceWrite(traceDir, "error.txt", []byte("fetch: "+err.Error()))
-        return
-    }
+	html, fromCache, err := p.fetchHTML(ctx, url)
+	if err != nil {
+		log.Printf("[reader] fetch failed: %v", err)
+		p.traceWrite(traceDir, "error.txt", []byte("fetch: "+err.Error()))
+		return
+	}
 	p.traceWrite(traceDir, "fetch_source.txt", []byte(map[bool]string{true: "cache", false: "mcp"}[fromCache]))
 	p.traceWrite(traceDir, "fetch.html", []byte(html))
 	log.Printf("[reader] fetchHTML succ")
 
-    // Extract metadata (with internal caching) and receive Readwise-ready body
-    body, metaFromCache, err := p.extractMetadata(ctx, html, url, traceDir)
-    if err != nil {
-        log.Printf("[reader] extract failed: %v", err)
-        p.traceWrite(traceDir, "error.txt", []byte("extract: "+err.Error()))
-        return
-    }
-    if metaFromCache {
-        log.Printf("[reader] extractMetadata cache hit")
-    } else {
-        log.Printf("[reader] extractMetadata computed")
-    }
+	// Extract metadata (with internal caching) and receive Readwise-ready body
+	body, metaFromCache, err := p.extractMetadata(ctx, html, url, traceDir)
+	if err != nil {
+		log.Printf("[reader] extract failed: %v", err)
+		p.traceWrite(traceDir, "error.txt", []byte("extract: "+err.Error()))
+		return
+	}
+	if metaFromCache {
+		log.Printf("[reader] extractMetadata cache hit")
+	} else {
+		log.Printf("[reader] extractMetadata computed")
+	}
 
-    if err := p.saveToReadwise(ctx, body, traceDir); err != nil {
-        log.Printf("[reader] save to readwise failed: %v", err)
-        p.traceWrite(traceDir, "error.txt", []byte("readwise: "+err.Error()))
-        return
-    }
+	if err := p.saveToReadwise(ctx, body, traceDir); err != nil {
+		log.Printf("[reader] save to readwise failed: %v", err)
+		p.traceWrite(traceDir, "error.txt", []byte("readwise: "+err.Error()))
+		return
+	}
 	log.Printf("[reader] saveToReadwise succ")
 
 	log.Printf("[reader] done url=%s in %s", url, time.Since(start))
@@ -116,34 +116,35 @@ func (p *Processor) fetchViaMCPHTTP(ctx context.Context, url string) (string, er
 // extractMetadata returns a Readwise-ready body map. It encapsulates LLM extraction
 // and local caching (like fetchHTML), and writes trace logs.
 func (p *Processor) extractMetadata(ctx context.Context, html, url, traceDir string) (map[string]any, bool, error) {
-    if p.cfg.LLMBaseURL == "" || p.cfg.LLMAPIKey == "" || p.cfg.LLMModel == "" {
-        return nil, false, errors.New("LLM config missing (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL)")
-    }
-    // Truncate excessively long HTML to reduce token usage
-    const maxChars = 100_000
-    if len(html) > maxChars {
-        html = html[:maxChars]
-    }
+	if p.cfg.LLMBaseURL == "" || p.cfg.LLMAPIKey == "" || p.cfg.LLMModel == "" {
+		return nil, false, errors.New("LLM config missing (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL)")
+	}
+	// Truncate excessively long HTML to reduce token usage
+	const maxChars = 100_000
+	if len(html) > maxChars {
+		// html = html[:maxChars]
+		log.Printf("html toooooo long, %d", len(html))
+	}
 
-    systemPrompt := "你是一名严谨的网页内容解析器。只输出一个合法 JSON 对象，不要输出任何多余字符，也不要使用 Markdown 代码块。JSON 必须严格符合 Readwise Reader 保存接口所需的字段与类型。"
-    userPrompt := buildExtractionPrompt(url, html)
-    p.traceWrite(traceDir, "extract_prompt_system.txt", []byte(systemPrompt))
-    p.traceWrite(traceDir, "extract_prompt_user.txt", []byte(userPrompt))
+	systemPrompt := "你是一名严谨的网页内容解析器。只输出一个合法 JSON 对象，不要输出任何多余字符，也不要使用 Markdown 代码块。JSON 必须严格符合 Readwise Reader 保存接口所需的字段与类型。"
+	userPrompt := buildExtractionPrompt(url, html)
+	p.traceWrite(traceDir, "extract_prompt_system.txt", []byte(systemPrompt))
+	p.traceWrite(traceDir, "extract_prompt_user.txt", []byte(userPrompt))
 
-    // Try body cache first
-    if cached, ok := p.tryReadMetaCache(url); ok {
-        if b, _ := json.MarshalIndent(cached, "", "  "); len(b) > 0 {
-            p.traceWrite(traceDir, "extracted_cached.json", b)
-        }
-        return cached, true, nil
-    }
+	// Try body cache first
+	if cached, ok := p.tryReadMetaCache(url); ok {
+		if b, _ := json.MarshalIndent(cached, "", "  "); len(b) > 0 {
+			p.traceWrite(traceDir, "extracted_cached.json", b)
+		}
+		return cached, true, nil
+	}
 
 	// OpenAI official Go SDK
 	opts := []option.RequestOption{option.WithAPIKey(p.cfg.LLMAPIKey)}
 	if p.cfg.LLMBaseURL != "" {
 		opts = append(opts, option.WithBaseURL(strings.TrimRight(p.cfg.LLMBaseURL, "/")))
 	}
-    client := openai.NewClient(opts...)
+	client := openai.NewClient(opts...)
 
 	resp, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 		Model:       shared.ChatModel(p.cfg.LLMModel),
@@ -153,12 +154,12 @@ func (p *Processor) extractMetadata(ctx context.Context, html, url, traceDir str
 			openai.UserMessage(userPrompt),
 		},
 	})
-    if err != nil {
-        return nil, false, fmt.Errorf("llm request: %w", err)
-    }
-    if len(resp.Choices) == 0 {
-        return nil, false, errors.New("llm no choices")
-    }
+	if err != nil {
+		return nil, false, fmt.Errorf("llm request: %w", err)
+	}
+	if len(resp.Choices) == 0 {
+		return nil, false, errors.New("llm no choices")
+	}
 	txt := strings.TrimSpace(resp.Choices[0].Message.Content)
 	// strip code fences if present
 	txt = strings.TrimPrefix(txt, "```json")
@@ -167,20 +168,20 @@ func (p *Processor) extractMetadata(ctx context.Context, html, url, traceDir str
 	txt = strings.TrimSpace(txt)
 	p.traceWrite(traceDir, "llm_raw_response.txt", []byte(txt))
 
-    var meta map[string]any
-    if err := json.Unmarshal([]byte(txt), &meta); err != nil {
-        return nil, false, fmt.Errorf("llm json parse: %w", err)
-    }
-    if b, _ := json.MarshalIndent(meta, "", "  "); len(b) > 0 {
-        p.traceWrite(traceDir, "extracted.json", b)
-    }
-    // Build body and cache it
-    body := buildReadwiseBody(meta)
-    if b, _ := json.MarshalIndent(body, "", "  "); len(b) > 0 {
-        p.traceWrite(traceDir, "extracted_body.json", b)
-    }
-    _ = p.writeMetaCache(url, body)
-    return body, false, nil
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(txt), &meta); err != nil {
+		return nil, false, fmt.Errorf("llm json parse: %w", err)
+	}
+	if b, _ := json.MarshalIndent(meta, "", "  "); len(b) > 0 {
+		p.traceWrite(traceDir, "extracted.json", b)
+	}
+	// Build body and cache it
+	body := buildReadwiseBody(meta)
+	if b, _ := json.MarshalIndent(body, "", "  "); len(b) > 0 {
+		p.traceWrite(traceDir, "extracted_body.json", b)
+	}
+	_ = p.writeMetaCache(url, body)
+	return body, false, nil
 }
 
 func buildExtractionPrompt(url, html string) string {
@@ -586,19 +587,21 @@ func (p *Processor) writeCache(url, html string) error {
 }
 
 func (p *Processor) cacheFilePath(url string) string {
-    dir := strings.TrimSpace(p.cfg.ReaderCacheDir)
-    if dir == "" {
-        return ""
-    }
-    h := hashURL(url)
-    return filepath.Join(dir, h+".html")
+	dir := strings.TrimSpace(p.cfg.ReaderCacheDir)
+	if dir == "" {
+		return ""
+	}
+	h := hashURL(url)
+	return filepath.Join(dir, h+".html")
 }
 
 func (p *Processor) cacheMetaFilePath(url string) string {
-    dir := strings.TrimSpace(p.cfg.ReaderCacheDir)
-    if dir == "" { return "" }
-    h := hashURL(url)
-    return filepath.Join(dir, h+".body.json")
+	dir := strings.TrimSpace(p.cfg.ReaderCacheDir)
+	if dir == "" {
+		return ""
+	}
+	h := hashURL(url)
+	return filepath.Join(dir, h+".body.json")
 }
 
 func hashURL(s string) string {
@@ -616,50 +619,90 @@ func sha256Sum(b []byte) string {
 
 // tryReadMetaCache loads a previously computed Readwise body JSON if present
 func (p *Processor) tryReadMetaCache(url string) (map[string]any, bool) {
-    path := p.cacheMetaFilePath(url)
-    if path == "" { return nil, false }
-    b, err := os.ReadFile(path)
-    if err != nil || len(b) == 0 { return nil, false }
-    var v map[string]any
-    if err := json.Unmarshal(b, &v); err != nil { return nil, false }
-    return v, true
+	path := p.cacheMetaFilePath(url)
+	if path == "" {
+		return nil, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || len(b) == 0 {
+		return nil, false
+	}
+	var v map[string]any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return nil, false
+	}
+	return v, true
 }
 
 func (p *Processor) writeMetaCache(url string, body map[string]any) error {
-    path := p.cacheMetaFilePath(url)
-    if path == "" { return nil }
-    if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { return err }
-    b, _ := json.MarshalIndent(body, "", "  ")
-    tmp := path + ".tmp"
-    if err := os.WriteFile(tmp, b, 0o644); err != nil { return err }
-    return os.Rename(tmp, path)
+	path := p.cacheMetaFilePath(url)
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	b, _ := json.MarshalIndent(body, "", "  ")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // buildReadwiseBody converts extracted meta into a strictly-typed Reader API body
 func buildReadwiseBody(meta map[string]any) map[string]any {
-    body := make(map[string]any)
-    if s, ok := toString(meta["url"]); ok { body["url"] = s }
-    if s, ok := toString(meta["html"]); ok && s != "" { body["html"] = s }
-    body["should_clean_html"] = toBool(meta["should_clean_html"], true)
-    if s, ok := toString(meta["title"]); ok { body["title"] = s }
-    if s, ok := toString(meta["author"]); ok { body["author"] = s }
-    if s, ok := toString(meta["published_date"]); ok {
-        if iso, ok2 := normalizePublishedDateChina(s); ok2 { body["published_date"] = iso }
-    }
-    if s, ok := toString(meta["image_url"]); ok { body["image_url"] = s }
-    if s, ok := toString(meta["summary"]); ok { body["summary"] = s }
-    if s, ok := toString(meta["category"]); ok { body["category"] = s }
-    if tags := toStringSlice(meta["tags"]); len(tags) > 0 { body["tags"] = tags }
-    if s, ok := toNotesString(meta["notes"]); ok { body["notes"] = s }
-    if s, ok := toString(meta["location"]); ok {
-        switch strings.ToLower(s) {
-        case "new", "later", "archive", "feed":
-            body["location"] = strings.ToLower(s)
-        }
-    }
-    if s, ok := toString(meta["saved_using"]); ok { body["saved_using"] = s }
-    if _, ok := body["location"]; !ok { body["location"] = "new" }
-    if _, ok := body["saved_using"]; !ok { body["saved_using"] = "web_extractor" }
-    if _, ok := body["category"]; !ok { body["category"] = "article" }
-    return body
+	body := make(map[string]any)
+	if s, ok := toString(meta["url"]); ok {
+		body["url"] = s
+	}
+	if s, ok := toString(meta["html"]); ok && s != "" {
+		body["html"] = s
+	}
+	body["should_clean_html"] = toBool(meta["should_clean_html"], true)
+	if s, ok := toString(meta["title"]); ok {
+		body["title"] = s
+	}
+	if s, ok := toString(meta["author"]); ok {
+		body["author"] = s
+	}
+	if s, ok := toString(meta["published_date"]); ok {
+		if iso, ok2 := normalizePublishedDateChina(s); ok2 {
+			body["published_date"] = iso
+		}
+	}
+	if s, ok := toString(meta["image_url"]); ok {
+		body["image_url"] = s
+	}
+	if s, ok := toString(meta["summary"]); ok {
+		body["summary"] = s
+	}
+	if s, ok := toString(meta["category"]); ok {
+		body["category"] = s
+	}
+	if tags := toStringSlice(meta["tags"]); len(tags) > 0 {
+		body["tags"] = tags
+	}
+	if s, ok := toNotesString(meta["notes"]); ok {
+		body["notes"] = s
+	}
+	if s, ok := toString(meta["location"]); ok {
+		switch strings.ToLower(s) {
+		case "new", "later", "archive", "feed":
+			body["location"] = strings.ToLower(s)
+		}
+	}
+	if s, ok := toString(meta["saved_using"]); ok {
+		body["saved_using"] = s
+	}
+	if _, ok := body["location"]; !ok {
+		body["location"] = "new"
+	}
+	if _, ok := body["saved_using"]; !ok {
+		body["saved_using"] = "web_extractor"
+	}
+	if _, ok := body["category"]; !ok {
+		body["category"] = "article"
+	}
+	return body
 }
