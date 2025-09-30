@@ -1,10 +1,13 @@
-ARG GO_VERSION=1.21
+ARG GO_VERSION=1.23
 
 FROM golang:${GO_VERSION}-alpine AS builder
 WORKDIR /src
 
 # Optional tools; public modules do not require git when using proxy
 RUN apk add --no-cache ca-certificates tzdata
+
+# Ensure Go can automatically use the toolchain specified by go.mod
+ENV GOTOOLCHAIN=auto
 
 # Cache go mod separately for faster builds
 COPY go.mod ./
