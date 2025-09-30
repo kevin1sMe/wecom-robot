@@ -8,7 +8,6 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -138,13 +137,17 @@ func handleMessage(cfg *config.Config, proc *reader.Processor, wc *wecom.WXBizMs
 	// 尝试解析消息类型；事件类型按标准返回明文 success；非事件回复加密文本 "OK"
 	var rm receivedMessage
 	if err := xml.Unmarshal(msg, &rm); err != nil {
+		log.Printf("[DEBUG] 解析消息失败: %v", err)
 		// 如果解析失败，作为兜底：返回明文 success（避免回包失败重试）
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("success"))
 		return
 	}
 
+	log.Printf("[DEBUG] 解析成功 - MsgType: %s, Content: %s", rm.MsgType, rm.Content)
+
 	if rm.MsgType == "event" {
+		log.Printf("[DEBUG] 收到事件消息，直接返回success")
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("success"))
 		return
@@ -152,10 +155,22 @@ func handleMessage(cfg *config.Config, proc *reader.Processor, wc *wecom.WXBizMs
 
 	// 如果是文本消息并且包含 http/https 链接，则异步触发 Go 处理流水线
 	if rm.MsgType == "text" {
+		log.Printf("[DEBUG] 收到文本消息，检查是否包含URL")
+		trimmed := strings.TrimSpace(rm.Content)
+		preview := trimmed
+		if len(preview) > 200 {
+			preview = preview[:200] + "..."
+		}
+		log.Printf("[DEBUG] URL 触发策略: 仅当 Content 以 http/https 开头 时才触发; Content(trim)='%s'", preview)
 		if url := firstHTTPURL(rm.Content); url != "" {
+			log.Printf("[DEBUG] 发现URL: %s，开始异步处理", url)
 			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 			go func() { defer cancel(); proc.ProcessURL(ctx, url) }()
+		} else {
+			log.Printf("[DEBUG] 文本消息中未触发URL处理（未以 http/https 开头或为空）")
 		}
+	} else {
+		log.Printf("[DEBUG] 非文本消息，跳过URL处理")
 	}
 
 	// 构造被动回复文本消息（OK），使用官方实现加密并生成标准回包 XML
@@ -190,15 +205,17 @@ func randString(n int) string {
 
 // firstHTTPURL 提取文本中的第一个 http/https 链接
 func firstHTTPURL(text string) string {
-	s := strings.TrimSpace(text)
-	// 快速路径：整个内容就是链接
-	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
-		return s
-	}
-	// 在文本中匹配第一个 http/https 链接
-	re := regexp.MustCompile(`https?://\S+`)
-	m := re.FindString(s)
-	return m
+    s := strings.TrimSpace(text)
+    log.Printf("[DEBUG] firstHTTPURL - 原始文本: '%s'", text)
+    log.Printf("[DEBUG] firstHTTPURL - 去空格后: '%s'", s)
+    // 严格策略：仅当整个内容以 http/https 开头时返回
+    hasPrefix := strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+    log.Printf("[DEBUG] firstHTTPURL - 前缀判断: %v", hasPrefix)
+    if hasPrefix {
+        return s
+    }
+    // 不再匹配正文中的其他链接位置
+    return ""
 }
 
 // (no-op placeholder removed)
