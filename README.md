@@ -61,11 +61,19 @@ GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
 
 - GitHub Actions 会在 push/pr 触发，构建并推送镜像到腾讯云 TCR（需在环境 secrets 配置 `TCR_REGISTRY`、`TCR_NAMESPACE`、`TCR_REPOSITORY`、`TCR_USERNAME`、`TCR_PASSWORD`）。
 
-## 接口
+## 回调 URL 配置与接口
 
-- `GET /callback`：URL 校验。参数 `msg_signature`、`timestamp`、`nonce`、`echostr`。
+企业微信后台“回调 URL”可以配置为：
+- 根路径：`https://<your-domain>/`（本项目已支持）
+- 指定路径：`https://<your-domain>/callback`
+
+同一个回调 URL 同时承担两种行为：
+- `GET` 验证 URL：企业微信会携带 `msg_signature`、`timestamp`、`nonce`、`echostr` 参数发起请求，服务端需要验签并解密 `echostr` 原样返回。
+- `POST` 接收消息：企业微信会携带 `msg_signature`、`timestamp`、`nonce` 参数，并在 Body 的 XML 里包含 `<Encrypt>` 字段。
+
+- `GET /callback` 或 `GET /`：URL 校验。参数 `msg_signature`、`timestamp`、`nonce`、`echostr`。
   - 验签并解密 `echostr`，原样返回解密后的 echo 字符串。
-- `POST /callback`：消息接收。参数 `msg_signature`、`timestamp`、`nonce`；Body 为包含 `<Encrypt>` 的 XML。
+- `POST /callback` 或 `POST /`：消息接收。参数 `msg_signature`、`timestamp`、`nonce`；Body 为包含 `<Encrypt>` 的 XML。
   - 验签并解密消息；日志打印解密后的原始 XML。
   - 若为非事件消息：被动加密回复文本“OK”（标准回包 XML）。
   - 若为事件消息：返回明文 `success`。
@@ -80,7 +88,9 @@ GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
 </xml>
 ```
 
-注意：`msg_signature`、`timestamp`、`nonce` 作为查询参数传递；Body 只需 `<Encrypt>` 字段即可。
+注意：`msg_signature`、`timestamp`、`nonce`、`echostr` 作为查询参数传递；Body 只需 `<Encrypt>` 字段即可。
+
+健康检查：`GET /` 无参数时返回 `ok`。
 
 被动回复说明：
 - 需要正确设置 `WECOM_RECEIVE_ID`（企业ID或SuiteID），否则无法进行加密回包（服务会兜底返回明文 `success`）。
