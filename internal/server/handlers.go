@@ -34,18 +34,48 @@ type receivedMessage struct {
 }
 
 func NewMux(wc *wecom.Crypto) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			handleVerify(wc, w, r)
-		case http.MethodPost:
-			handleMessage(wc, w, r)
-		default:
-			w.WriteHeader(http.StatusMethodNotAllowed)
-		}
-	})
-	return mux
+    mux := http.NewServeMux()
+    mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+        switch r.Method {
+        case http.MethodGet:
+            handleVerify(wc, w, r)
+        case http.MethodPost:
+            handleMessage(wc, w, r)
+        default:
+            w.WriteHeader(http.StatusMethodNotAllowed)
+        }
+    })
+
+    // 支持根路径作为回调 URL（便于直接将域名配置为回调）
+    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        // 仅处理精确的根路径，其它子路径交给默认 404
+        if r.URL.Path != "/" {
+            http.NotFound(w, r)
+            return
+        }
+        switch r.Method {
+        case http.MethodGet:
+            // 若包含验签参数则执行 URL 验证，否则返回健康检查 OK
+            q := r.URL.Query()
+            if q.Get("msg_signature") != "" && q.Get("timestamp") != "" && q.Get("nonce") != "" && q.Get("echostr") != "" {
+                handleVerify(wc, w, r)
+                return
+            }
+            w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+            _, _ = w.Write([]byte("ok"))
+        case http.MethodPost:
+            // 若包含消息签名参数则处理消息，否则提示缺少参数
+            q := r.URL.Query()
+            if q.Get("msg_signature") != "" && q.Get("timestamp") != "" && q.Get("nonce") != "" {
+                handleMessage(wc, w, r)
+                return
+            }
+            http.Error(w, "missing query params", http.StatusBadRequest)
+        default:
+            w.WriteHeader(http.StatusMethodNotAllowed)
+        }
+    })
+    return mux
 }
 
 func handleVerify(wc *wecom.Crypto, w http.ResponseWriter, r *http.Request) {
