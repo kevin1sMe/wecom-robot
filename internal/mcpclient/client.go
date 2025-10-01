@@ -1,16 +1,16 @@
 package mcpclient
 
 import (
-    "context"
-    "encoding/json"
-    "errors"
-    "fmt"
-    "strings"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 
-    mcpclient "github.com/mark3labs/mcp-go/client"
-    "github.com/mark3labs/mcp-go/client/transport"
-    mcp "github.com/mark3labs/mcp-go/mcp"
-    "wecom-robot/internal/params"
+	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
+	mcp "github.com/mark3labs/mcp-go/mcp"
+	"wecom-robot/internal/params"
 )
 
 // Client wraps an MCP HTTP endpoint and a tool name (default "http").
@@ -86,83 +86,83 @@ func (c *Client) FetchURL(ctx context.Context, url string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("mcp call tool: %w", err)
 	}
-    // Prefer structuredContent.html when available (especially for scrape_wechat_article)
-    if result != nil && result.StructuredContent != nil {
-        if m, ok := result.StructuredContent.(map[string]any); ok {
-            if s := extractHTMLFromMap(m); s != "" {
-                return s, nil
-            }
-        } else {
-            if b, err := json.Marshal(result.StructuredContent); err == nil {
-                var mv map[string]any
-                if json.Unmarshal(b, &mv) == nil {
-                    if s := extractHTMLFromMap(mv); s != "" {
-                        return s, nil
-                    }
-                }
-            }
-        }
-    }
-    // Then try typed content
-    if result != nil && len(result.Content) > 0 {
-        var sb strings.Builder
-        for _, part := range result.Content {
-            switch v := part.(type) {
-            case mcp.TextContent:
-                sb.WriteString(v.Text)
-            default:
-                // ignore non-text parts here
-            }
-        }
-        if sb.Len() > 0 {
-            s := sb.String()
-            // If the tool returned a JSON envelope, try extract `html` field
-            st := strings.TrimSpace(s)
-            if len(st) > 0 && (st[0] == '{' || st[0] == '[') {
-                if h, ok := extractHTMLFromJSON(st); ok && h != "" {
-                    return h, nil
-                }
-            }
-            return s, nil
-        }
-    }
+	// Prefer structuredContent.html when available (especially for scrape_wechat_article)
+	if result != nil && result.StructuredContent != nil {
+		if m, ok := result.StructuredContent.(map[string]any); ok {
+			if s := extractHTMLFromMap(m); s != "" {
+				return s, nil
+			}
+		} else {
+			if b, err := json.Marshal(result.StructuredContent); err == nil {
+				var mv map[string]any
+				if json.Unmarshal(b, &mv) == nil {
+					if s := extractHTMLFromMap(mv); s != "" {
+						return s, nil
+					}
+				}
+			}
+		}
+	}
+	// Then try typed content
+	if result != nil && len(result.Content) > 0 {
+		var sb strings.Builder
+		for _, part := range result.Content {
+			switch v := part.(type) {
+			case mcp.TextContent:
+				sb.WriteString(v.Text)
+			default:
+				// ignore non-text parts here
+			}
+		}
+		if sb.Len() > 0 {
+			s := sb.String()
+			// If the tool returned a JSON envelope, try extract `html` field
+			st := strings.TrimSpace(s)
+			if len(st) > 0 && (st[0] == '{' || st[0] == '[') {
+				if h, ok := extractHTMLFromJSON(st); ok && h != "" {
+					return h, nil
+				}
+			}
+			return s, nil
+		}
+	}
 	// Fallback to JSON parse
 	b, err := json.Marshal(result)
 	if err != nil {
 		return "", fmt.Errorf("marshal result: %w", err)
 	}
-    var v map[string]any
-    if err := json.Unmarshal(b, &v); err != nil {
-        return string(b), nil
-    }
-    if s := extractHTMLFromMap(v); s != "" {
-        return s, nil
-    }
-    if s := extractTextFromMap(v); s != "" {
-        return s, nil
-    }
-    return string(b), nil
+	var v map[string]any
+	if err := json.Unmarshal(b, &v); err != nil {
+		return string(b), nil
+	}
+	if s := extractHTMLFromMap(v); s != "" {
+		return s, nil
+	}
+	if s := extractTextFromMap(v); s != "" {
+		return s, nil
+	}
+	return string(b), nil
 }
 
 func extractTextFromMap(m map[string]any) string {
-    // Prefer explicit HTML if present
-    if s, ok := m["html"].(string); ok && s != "" {
-        return s
-    }
-    if c, ok := m["content"].([]any); ok {
-        if s := collectText(c); s != "" {
-            return s
-        }
-    }
-    if result, ok := m["result"].(map[string]any); ok {
-        if s, ok := result["html"].(string); ok && s != "" {
-            return s
-        }
-        if c, ok := result["content"].([]any); ok {
-            if s := collectText(c); s != "" {
-                return s
-            }
-        }
+	// Prefer explicit HTML if present
+	if s, ok := m["html"].(string); ok && s != "" {
+		return s
+	}
+	if c, ok := m["content"].([]any); ok {
+		if s := collectText(c); s != "" {
+			return s
+		}
+	}
+	if result, ok := m["result"].(map[string]any); ok {
+		if s, ok := result["html"].(string); ok && s != "" {
+			return s
+		}
+		if c, ok := result["content"].([]any); ok {
+			if s := collectText(c); s != "" {
+				return s
+			}
+		}
 		if s, ok := result["content"].(string); ok && s != "" {
 			return s
 		}
@@ -212,35 +212,35 @@ func collectText(parts []any) string {
 
 // extractHTMLFromJSON attempts to parse a JSON string and locate a string field named "html".
 func extractHTMLFromJSON(s string) (string, bool) {
-    var v map[string]any
-    if err := json.Unmarshal([]byte(s), &v); err != nil {
-        return "", false
-    }
-    if h := extractHTMLFromMap(v); h != "" {
-        return h, true
-    }
-    return "", false
+	var v map[string]any
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
+		return "", false
+	}
+	if h := extractHTMLFromMap(v); h != "" {
+		return h, true
+	}
+	return "", false
 }
 
 // extractHTMLFromMap searches common locations for an HTML payload.
 func extractHTMLFromMap(m map[string]any) string {
-    if s, ok := m["html"].(string); ok && strings.TrimSpace(s) != "" {
-        return s
-    }
-    if result, ok := m["result"].(map[string]any); ok {
-        if s, ok := result["html"].(string); ok && strings.TrimSpace(s) != "" {
-            return s
-        }
-    }
-    if sc, ok := m["structuredContent"].(map[string]any); ok {
-        if s, ok := sc["html"].(string); ok && strings.TrimSpace(s) != "" {
-            return s
-        }
-    }
-    if data, ok := m["data"].(map[string]any); ok {
-        if s, ok := data["html"].(string); ok && strings.TrimSpace(s) != "" {
-            return s
-        }
-    }
-    return ""
+	if s, ok := m["html"].(string); ok && strings.TrimSpace(s) != "" {
+		return s
+	}
+	if result, ok := m["result"].(map[string]any); ok {
+		if s, ok := result["html"].(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	if sc, ok := m["structuredContent"].(map[string]any); ok {
+		if s, ok := sc["html"].(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	if data, ok := m["data"].(map[string]any); ok {
+		if s, ok := data["html"].(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
 }

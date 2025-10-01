@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"net"
 	"strings"
 	"time"
 
@@ -18,20 +19,50 @@ type Redis struct {
 // NewRedis builds a Redis cache client from addr (host:port or redis:// URL),
 // key prefix, and TTL. Caller owns lifecycle; Close when done if needed.
 func NewRedis(addr, prefix string, ttl time.Duration) *Redis {
-	// Support both "host:port" and redis URL forms.
-	// If addr starts with redis://, use ParseURL for richer options.
-	var client *redis.Client
+	// Reasonable defaults per request: 1s timeouts, 3 retries, TCP keepalive.
+	// Support both "host:port" and redis URL forms. If parse fails, fall back to Addr.
+	makeOpts := func() *redis.Options {
+		// Shared dialer with 1s connect timeout and TCP keepalive
+		d := &net.Dialer{Timeout: time.Second, KeepAlive: 30 * time.Second}
+		return &redis.Options{
+			Addr:         strings.TrimSpace(addr),
+			DialTimeout:  time.Second,
+			ReadTimeout:  time.Second,
+			WriteTimeout: time.Second,
+			// Retry up to 3 times with small backoff
+			MaxRetries:      3,
+			MinRetryBackoff: 100 * time.Millisecond,
+			MaxRetryBackoff: 500 * time.Millisecond,
+			// Use custom dialer to ensure TCP keepalive
+			Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
+				return d.DialContext(ctx, network, address)
+			},
+		}
+	}
+
+	var opt *redis.Options
 	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(addr)), "redis://") {
-		opt, err := redis.ParseURL(addr)
-		if err == nil {
-			client = redis.NewClient(opt)
+		if parsed, err := redis.ParseURL(addr); err == nil {
+			// Preserve parsed settings (Addr/DB/Username/Password), then apply our timeouts/retries/keepalive
+			opt = parsed
+			opt.DialTimeout = time.Second
+			opt.ReadTimeout = time.Second
+			opt.WriteTimeout = time.Second
+			opt.MaxRetries = 3
+			opt.MinRetryBackoff = 100 * time.Millisecond
+			opt.MaxRetryBackoff = 500 * time.Millisecond
+			d := &net.Dialer{Timeout: time.Second, KeepAlive: 30 * time.Second}
+			opt.Dialer = func(ctx context.Context, network, address string) (net.Conn, error) {
+				return d.DialContext(ctx, network, address)
+			}
 		} else {
-			// Fallback to simple Addr if URL parse fails
-			client = redis.NewClient(&redis.Options{Addr: addr})
+			opt = makeOpts()
 		}
 	} else {
-		client = redis.NewClient(&redis.Options{Addr: addr})
+		opt = makeOpts()
 	}
+
+	client := redis.NewClient(opt)
 	if prefix == "" {
 		prefix = "wecom-robot"
 	}
@@ -61,7 +92,10 @@ func (r *Redis) GetString(ctx context.Context, key string) (string, bool, error)
 	if r == nil || r.cli == nil || key == "" {
 		return "", false, nil
 	}
-	v, err := r.cli.Get(ctx, key).Result()
+	// Per-call bound: 1s total to avoid long hangs (parent deadline may be shorter)
+	cctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	v, err := r.cli.Get(cctx, key).Result()
 	if err == redis.Nil {
 		return "", false, nil
 	}
@@ -76,5 +110,8 @@ func (r *Redis) SetString(ctx context.Context, key, value string) error {
 	if r == nil || r.cli == nil || key == "" {
 		return nil
 	}
-	return r.cli.Set(ctx, key, value, r.ttl).Err()
+	// Per-call bound: 1s total with built-in client retries
+	cctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	return r.cli.Set(cctx, key, value, r.ttl).Err()
 }
