@@ -315,10 +315,10 @@ func (p *Processor) saveToReadwise(ctx context.Context, meta map[string]any, ori
 	if s, ok := toString(meta["url"]); ok {
 		body["url"] = s
 	}
-	// Always include original fetched HTML for Reader cleaning
-	if hs := strings.TrimSpace(originalHTML); hs != "" {
-		body["html"] = hs
-	}
+    // Include original fetched HTML only if it looks like HTML (avoid forwarding JSON envelopes)
+    if hs := strings.TrimSpace(originalHTML); hs != "" && looksLikeHTML(hs) {
+        body["html"] = hs
+    }
 	body["should_clean_html"] = toBool(meta["should_clean_html"], true)
 	if s, ok := toString(meta["title"]); ok {
 		body["title"] = s
@@ -575,6 +575,25 @@ func filterNotEmpty(in []string) []string {
 		}
 	}
 	return out
+}
+
+// looksLikeHTML makes a light-weight guess whether the string is HTML markup.
+func looksLikeHTML(s string) bool {
+    if s == "" {
+        return false
+    }
+    t := strings.ToLower(strings.TrimSpace(s))
+    if strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[") {
+        return false
+    }
+    if strings.HasPrefix(t, "<!doctype") || strings.HasPrefix(t, "<html") || strings.HasPrefix(t, "<head") || strings.HasPrefix(t, "<body") {
+        return true
+    }
+    // Heuristic: contains common block-level tags
+    if strings.Contains(t, "<p") || strings.Contains(t, "</p>") || strings.Contains(t, "<div") || strings.Contains(t, "</div>") || strings.Contains(t, "<article") {
+        return true
+    }
+    return false
 }
 
 // isLikelyHTTPURL returns true if s starts with http:// or https://
