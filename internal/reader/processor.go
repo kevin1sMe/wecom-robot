@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -95,14 +97,19 @@ func (p *Processor) ProcessURL(ctx context.Context, url string) {
 	// Step: save to Readwise (<= 5m)
 	stepSaveStart := time.Now()
 	log.Printf("[reader] job=%s step=save_readwise event=start", jobShort)
-	ctxSave, cancelSave := context.WithTimeout(ctx, params.StepTimeout)
-	if err := p.saveToReadwise(ctxSave, body, traceDir); err != nil {
+    ctxSave, cancelSave := context.WithTimeout(ctx, params.StepTimeout)
+    defer cancelSave()
+    link, err := p.saveToReadwise(ctxSave, body, html, traceDir)
+	if err != nil {
 		log.Printf("[reader] job=%s step=save_readwise event=error err=%v", jobShort, err)
 		p.traceWrite(traceDir, "error.txt", []byte("readwise: "+err.Error()))
 		return
 	}
-	cancelSave()
-	log.Printf("[reader] job=%s step=save_readwise event=end dur=%s", jobShort, time.Since(stepSaveStart))
+    if strings.TrimSpace(link) != "" {
+        log.Printf("[reader] job=%s step=save_readwise event=end dur=%s url=%s", jobShort, time.Since(stepSaveStart), link)
+    } else {
+        log.Printf("[reader] job=%s step=save_readwise event=end dur=%s", jobShort, time.Since(stepSaveStart))
+    }
 
 	log.Printf("[reader] job=%s step=process event=end url=%s dur=%s", jobShort, url, time.Since(start))
 }
@@ -296,10 +303,10 @@ func buildExtractionPrompt(url, html string) string {
 	return sb.String()
 }
 
-func (p *Processor) saveToReadwise(ctx context.Context, meta map[string]any, traceDir string) error {
+func (p *Processor) saveToReadwise(ctx context.Context, meta map[string]any, originalHTML string, traceDir string) (string, error) {
 	token := p.cfg.ReadwiseToken
 	if token == "" {
-		return errors.New("missing READWISE_API_TOKEN")
+		return "", errors.New("missing READWISE_API_TOKEN")
 	}
 	// strictly type and sanitize per Reader API
 	body := make(map[string]any)
@@ -321,9 +328,9 @@ func (p *Processor) saveToReadwise(ctx context.Context, meta map[string]any, tra
 			body["published_date"] = iso
 		}
 	}
-	if s, ok := toString(meta["image_url"]); ok {
-		body["image_url"] = s
-	}
+    if s, ok := toString(meta["image_url"]); ok {
+        body["image_url"] = s
+    }
 	if s, ok := toString(meta["summary"]); ok {
 		body["summary"] = s
 	}
@@ -356,23 +363,84 @@ func (p *Processor) saveToReadwise(ctx context.Context, meta map[string]any, tra
 		body["saved_using"] = "web_extractor"
 	}
 
-	b, _ := json.Marshal(body)
+    // Ensure/derive image_url
+    baseURL, _ := toString(meta["url"])
+    if v, ok := body["image_url"]; ok {
+        s := toStringMust(v)
+        if s != "" && !isLikelyHTTPURL(s) {
+            if ru := resolveURL(baseURL, s); ru != "" {
+                body["image_url"] = ru
+            }
+        }
+    }
+    // Try meta og:image/twitter:image from original HTML
+    if _, ok := body["image_url"]; !ok || toStringMust(body["image_url"]) == "" {
+        if u := firstMetaImageURL(originalHTML); u != "" {
+            if ru := resolveURL(baseURL, u); ru != "" {
+                body["image_url"] = ru
+            } else {
+                body["image_url"] = u
+            }
+        }
+    }
+    // Fallback: if still missing, pick first image from article HTML
+    if _, ok := body["image_url"]; !ok || toStringMust(body["image_url"]) == "" {
+        // Prefer the article HTML returned by LLM; fallback to original fetched HTML
+        var articleHTML string
+        if s, ok := toString(meta["html"]); ok && s != "" {
+            articleHTML = s
+        } else {
+            articleHTML = originalHTML
+        }
+        if u := firstImageURL(articleHTML); u != "" {
+            if ru := resolveURL(baseURL, u); ru != "" {
+                body["image_url"] = ru
+            } else {
+                body["image_url"] = u
+            }
+        }
+    }
+
+    b, _ := json.Marshal(body)
 	p.traceWrite(traceDir, "readwise_request.json", b)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://readwise.io/api/v3/save/", bytes.NewReader(b))
 	req.Header.Set("Authorization", "Token "+token)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := p.hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("readwise request: %w", err)
+		return "", fmt.Errorf("readwise request: %w", err)
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(resp.Body)
 	p.traceWrite(traceDir, fmt.Sprintf("readwise_response_%d.txt", resp.StatusCode), rb)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("readwise status %d: %s", resp.StatusCode, string(rb))
+		return "", fmt.Errorf("readwise status %d: %s", resp.StatusCode, string(rb))
 	}
-	log.Printf("[reader] readwise saved OK")
-	return nil
+	// Try to parse response to extract created document link
+	var link, id string
+	var respJSON map[string]any
+	if err := json.Unmarshal(rb, &respJSON); err == nil {
+		if s, ok := toString(respJSON["url"]); ok {
+			link = s
+		}
+		if s, ok := toString(respJSON["id"]); ok {
+			id = s
+		}
+	}
+	// Fallback: construct from id if url missing
+	if link == "" && id != "" {
+		link = "https://read.readwise.io/read/" + id
+	}
+	if link != "" {
+		if id != "" {
+			log.Printf("[reader] readwise saved OK id=%s url=%s", id, link)
+		} else {
+			log.Printf("[reader] readwise saved OK url=%s", link)
+		}
+	} else {
+		log.Printf("[reader] readwise saved OK (no url in response)")
+	}
+	return link, nil
 }
 
 // makeTraceDir returns a unique trace dir for this URL processing run.
@@ -421,6 +489,14 @@ func toString(v any) (string, bool) {
 		}
 		return s, true
 	}
+}
+
+// toStringMust converts to string using toString, returns empty on failure.
+func toStringMust(v any) string {
+    if s, ok := toString(v); ok {
+        return s
+    }
+    return ""
 }
 
 func toBool(v any, def bool) bool {
@@ -503,6 +579,208 @@ func filterNotEmpty(in []string) []string {
 		}
 	}
 	return out
+}
+
+// isLikelyHTTPURL returns true if s starts with http:// or https://
+func isLikelyHTTPURL(s string) bool {
+    s = strings.TrimSpace(strings.ToLower(s))
+    return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+}
+
+// resolveURL resolves ref against base. Returns empty if cannot resolve.
+func resolveURL(base, ref string) string {
+    ref = strings.TrimSpace(ref)
+    if ref == "" {
+        return ""
+    }
+    if strings.HasPrefix(ref, "data:") || strings.HasPrefix(ref, "blob:") {
+        return ""
+    }
+    // Protocol-relative
+    if strings.HasPrefix(ref, "//") {
+        return "https:" + ref
+    }
+    // Already absolute
+    if isLikelyHTTPURL(ref) {
+        return ref
+    }
+    bu, err := url.Parse(base)
+    if err != nil || bu == nil {
+        return ""
+    }
+    ru, err := url.Parse(ref)
+    if err != nil || ru == nil {
+        return ""
+    }
+    return bu.ResolveReference(ru).String()
+}
+
+// firstImageURL tries to find the first <img> src or srcset URL in the html.
+// It returns the raw value (may be relative); caller should resolve to absolute.
+func firstImageURL(html string) string {
+    if strings.TrimSpace(html) == "" {
+        return ""
+    }
+    // Make a lowercase copy for searching while slicing from original
+    low := strings.ToLower(html)
+    i := 0
+    for {
+        idx := strings.Index(low[i:], "<img")
+        if idx < 0 {
+            break
+        }
+        // absolute position
+        pos := i + idx
+        // find end of tag
+        end := strings.IndexByte(low[pos:], '>')
+        if end < 0 {
+            break
+        }
+        endPos := pos + end
+        tag := html[pos : endPos+1]
+        tagLow := low[pos : endPos+1]
+        // Try src= first
+        if u := extractAttr(tag, tagLow, "src"); u != "" {
+            if isAcceptableImageURL(u) {
+                return u
+            }
+        }
+        // Try data-src (lazy load)
+        if u := extractAttr(tag, tagLow, "data-src"); u != "" {
+            if isAcceptableImageURL(u) {
+                return u
+            }
+        }
+        // Try data-original
+        if u := extractAttr(tag, tagLow, "data-original"); u != "" {
+            if isAcceptableImageURL(u) {
+                return u
+            }
+        }
+        // Try srcset: choose the first URL before whitespace/comma
+        if ss := extractAttr(tag, tagLow, "srcset"); ss != "" {
+            // srcset entries are like: "url1 1x, url2 2x"
+            comma := strings.Index(ss, ",")
+            if comma >= 0 {
+                ss = ss[:comma]
+            }
+            // take up to first whitespace
+            for j := 0; j < len(ss); j++ {
+                if ss[j] == ' ' || ss[j] == '\t' || ss[j] == '\n' {
+                    ss = ss[:j]
+                    break
+                }
+            }
+            if isAcceptableImageURL(ss) {
+                return ss
+            }
+        }
+        // advance
+        i = endPos + 1
+    }
+    return ""
+}
+
+// extractAttr gets attribute value from a single tag string; tagLow must be lowercase of tag.
+func extractAttr(tag, tagLow, name string) string {
+    // try with optional whitespace around '=' by scanning for name and then skipping spaces
+    start := 0
+    for {
+        idx := strings.Index(tagLow[start:], name)
+        if idx < 0 {
+            return ""
+        }
+        idx += start
+        // ensure boundary (prev not letter)
+        if idx > 0 {
+            prev := tagLow[idx-1]
+            if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '-' || prev == '_' {
+                start = idx + len(name)
+                continue
+            }
+        }
+        k := idx + len(name)
+        // skip spaces
+        for k < len(tagLow) && (tagLow[k] == ' ' || tagLow[k] == '\t' || tagLow[k] == '\n') {
+            k++
+        }
+        if k >= len(tagLow) || tagLow[k] != '=' {
+            start = idx + len(name)
+            continue
+        }
+        k++ // skip '='
+        for k < len(tagLow) && (tagLow[k] == ' ' || tagLow[k] == '\t' || tagLow[k] == '\n') {
+            k++
+        }
+        if k >= len(tag) {
+            return ""
+        }
+        // quote or unquoted
+        q := tag[k]
+        if q == '\'' || q == '"' {
+            k++
+            vstart := k
+            for k < len(tag) && tag[k] != q {
+                k++
+            }
+            if k <= len(tag) {
+                return html.UnescapeString(strings.TrimSpace(tag[vstart:k]))
+            }
+            return ""
+        }
+        // unquoted: read until space/>
+        vstart := k
+        for k < len(tag) && tag[k] != ' ' && tag[k] != '\t' && tag[k] != '\n' && tag[k] != '>' {
+            k++
+        }
+        return html.UnescapeString(strings.TrimSpace(tag[vstart:k]))
+    }
+}
+
+func isAcceptableImageURL(u string) bool {
+    if u == "" {
+        return false
+    }
+    ul := strings.ToLower(strings.TrimSpace(u))
+    if strings.HasPrefix(ul, "data:") || strings.HasPrefix(ul, "blob:") {
+        return false
+    }
+    return true
+}
+
+// firstMetaImageURL finds <meta property="og:image" content="..."> or
+// <meta name="twitter:image" content="..."> in the HTML head/body.
+func firstMetaImageURL(html string) string {
+    if strings.TrimSpace(html) == "" {
+        return ""
+    }
+    low := strings.ToLower(html)
+    i := 0
+    for {
+        idx := strings.Index(low[i:], "<meta")
+        if idx < 0 {
+            break
+        }
+        pos := i + idx
+        end := strings.IndexByte(low[pos:], '>')
+        if end < 0 {
+            break
+        }
+        endPos := pos + end
+        tag := html[pos : endPos+1]
+        tagLow := low[pos : endPos+1]
+        prop := strings.ToLower(extractAttr(tag, tagLow, "property"))
+        name := strings.ToLower(extractAttr(tag, tagLow, "name"))
+        if prop == "og:image" || prop == "og:image:url" || name == "twitter:image" || prop == "twitter:image" {
+            if c := extractAttr(tag, tagLow, "content"); c != "" {
+                if isAcceptableImageURL(c) {
+                    return c
+                }
+            }
+        }
+        i = endPos + 1
+    }
+    return ""
 }
 
 // normalizePublishedDateChina parses a variety of date/time formats and
@@ -593,20 +871,20 @@ func parseUnixTimestamp(s string) (time.Time, bool) {
 
 // tryReadCache returns cached HTML if found.
 func (p *Processor) tryReadCache(ctx context.Context, url string) (string, bool) {
-    // Prefer Redis if configured
-    if p.rc != nil {
-        key := p.rc.Key("html", hashURL(url))
-        if v, ok, err := p.rc.GetString(ctx, key); err == nil && ok {
-            return v, true
-        }
-        // Redis enabled: do not fallback to local file cache
-        return "", false
-    }
-    // Fallback to file cache (if enabled)
-    path := p.cacheFilePath(url)
-    if path == "" {
-        return "", false
-    }
+	// Prefer Redis if configured
+	if p.rc != nil {
+		key := p.rc.Key("html", hashURL(url))
+		if v, ok, err := p.rc.GetString(ctx, key); err == nil && ok {
+			return v, true
+		}
+		// Redis enabled: do not fallback to local file cache
+		return "", false
+	}
+	// Fallback to file cache (if enabled)
+	path := p.cacheFilePath(url)
+	if path == "" {
+		return "", false
+	}
 	b, err := os.ReadFile(path)
 	if err != nil || len(b) == 0 {
 		return "", false
@@ -616,29 +894,29 @@ func (p *Processor) tryReadCache(ctx context.Context, url string) (string, bool)
 
 // writeCache saves HTML to cache file (best-effort).
 func (p *Processor) writeCache(ctx context.Context, url, html string) error {
-    // When Redis is configured, use Redis only and do not write local files
-    if p.rc != nil {
-        key := p.rc.Key("html", hashURL(url))
-        if err := p.rc.SetString(ctx, key, html); err != nil {
-            log.Printf("[reader] redis set html error: %v", err)
-        } else {
-            log.Printf("[reader] redis set html ok key=%s bytes=%d ttl=%ds", key, len(html), p.cfg.RedisTTLSeconds)
-        }
-        return nil
-    }
-    // Local file cache (when Redis not in use)
-    path := p.cacheFilePath(url)
-    if path == "" {
-        return nil
-    }
-    if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-        return err
-    }
-    tmp := path + ".tmp"
-    if err := os.WriteFile(tmp, []byte(html), 0o644); err != nil {
-        return err
-    }
-    return os.Rename(tmp, path)
+	// When Redis is configured, use Redis only and do not write local files
+	if p.rc != nil {
+		key := p.rc.Key("html", hashURL(url))
+		if err := p.rc.SetString(ctx, key, html); err != nil {
+			log.Printf("[reader] redis set html error: %v", err)
+		} else {
+			log.Printf("[reader] redis set html ok key=%s bytes=%d ttl=%ds", key, len(html), p.cfg.RedisTTLSeconds)
+		}
+		return nil
+	}
+	// Local file cache (when Redis not in use)
+	path := p.cacheFilePath(url)
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(html), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func (p *Processor) cacheFilePath(url string) string {
@@ -674,23 +952,23 @@ func sha256Sum(b []byte) string {
 
 // tryReadMetaCache loads a previously computed Readwise body JSON if present
 func (p *Processor) tryReadMetaCache(ctx context.Context, url string) (map[string]any, bool) {
-    // Prefer Redis if configured
-    if p.rc != nil {
-        key := p.rc.Key("body", hashURL(url))
-        if s, ok, err := p.rc.GetString(ctx, key); err == nil && ok && s != "" {
-            var v map[string]any
-            if json.Unmarshal([]byte(s), &v) == nil {
-                return v, true
-            }
-        }
-        // Redis enabled: do not fallback to local file cache
-        return nil, false
-    }
-    // Fallback to file
-    path := p.cacheMetaFilePath(url)
-    if path == "" {
-        return nil, false
-    }
+	// Prefer Redis if configured
+	if p.rc != nil {
+		key := p.rc.Key("body", hashURL(url))
+		if s, ok, err := p.rc.GetString(ctx, key); err == nil && ok && s != "" {
+			var v map[string]any
+			if json.Unmarshal([]byte(s), &v) == nil {
+				return v, true
+			}
+		}
+		// Redis enabled: do not fallback to local file cache
+		return nil, false
+	}
+	// Fallback to file
+	path := p.cacheMetaFilePath(url)
+	if path == "" {
+		return nil, false
+	}
 	b, err := os.ReadFile(path)
 	if err != nil || len(b) == 0 {
 		return nil, false
@@ -703,31 +981,31 @@ func (p *Processor) tryReadMetaCache(ctx context.Context, url string) (map[strin
 }
 
 func (p *Processor) writeMetaCache(ctx context.Context, url string, body map[string]any) error {
-    // Marshal once for Redis and/or file
-    b, _ := json.MarshalIndent(body, "", "  ")
-    if p.rc != nil {
-        key := p.rc.Key("body", hashURL(url))
-        if err := p.rc.SetString(ctx, key, string(b)); err != nil {
-            log.Printf("[reader] redis set body error: %v", err)
-        } else {
-            log.Printf("[reader] redis set body ok key=%s bytes=%d ttl=%ds", key, len(b), p.cfg.RedisTTLSeconds)
-        }
-        // Do not write local files when Redis is enabled
-        return nil
-    }
-    // File (when Redis not in use)
-    path := p.cacheMetaFilePath(url)
-    if path == "" {
-        return nil
-    }
-    if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-        return err
-    }
-    tmp := path + ".tmp"
-    if err := os.WriteFile(tmp, b, 0o644); err != nil {
-        return err
-    }
-    return os.Rename(tmp, path)
+	// Marshal once for Redis and/or file
+	b, _ := json.MarshalIndent(body, "", "  ")
+	if p.rc != nil {
+		key := p.rc.Key("body", hashURL(url))
+		if err := p.rc.SetString(ctx, key, string(b)); err != nil {
+			log.Printf("[reader] redis set body error: %v", err)
+		} else {
+			log.Printf("[reader] redis set body ok key=%s bytes=%d ttl=%ds", key, len(b), p.cfg.RedisTTLSeconds)
+		}
+		// Do not write local files when Redis is enabled
+		return nil
+	}
+	// File (when Redis not in use)
+	path := p.cacheMetaFilePath(url)
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // buildReadwiseBody converts extracted meta into a strictly-typed Reader API body
