@@ -97,19 +97,19 @@ func (p *Processor) ProcessURL(ctx context.Context, url string) {
 	// Step: save to Readwise (<= 5m)
 	stepSaveStart := time.Now()
 	log.Printf("[reader] job=%s step=save_readwise event=start", jobShort)
-    ctxSave, cancelSave := context.WithTimeout(ctx, params.StepTimeout)
-    defer cancelSave()
-    link, err := p.saveToReadwise(ctxSave, body, html, traceDir)
+	ctxSave, cancelSave := context.WithTimeout(ctx, params.StepTimeout)
+	defer cancelSave()
+	link, err := p.saveToReadwise(ctxSave, body, html, traceDir)
 	if err != nil {
 		log.Printf("[reader] job=%s step=save_readwise event=error err=%v", jobShort, err)
 		p.traceWrite(traceDir, "error.txt", []byte("readwise: "+err.Error()))
 		return
 	}
-    if strings.TrimSpace(link) != "" {
-        log.Printf("[reader] job=%s step=save_readwise event=end dur=%s url=%s", jobShort, time.Since(stepSaveStart), link)
-    } else {
-        log.Printf("[reader] job=%s step=save_readwise event=end dur=%s", jobShort, time.Since(stepSaveStart))
-    }
+	if strings.TrimSpace(link) != "" {
+		log.Printf("[reader] job=%s step=save_readwise event=end dur=%s url=%s", jobShort, time.Since(stepSaveStart), link)
+	} else {
+		log.Printf("[reader] job=%s step=save_readwise event=end dur=%s", jobShort, time.Since(stepSaveStart))
+	}
 
 	log.Printf("[reader] job=%s step=process event=end url=%s dur=%s", jobShort, url, time.Since(start))
 }
@@ -157,13 +157,13 @@ func (p *Processor) extractMetadata(ctx context.Context, html, url, traceDir str
 		return nil, false, errors.New("LLM config missing (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL)")
 	}
 	// Truncate excessively long HTML to reduce token usage
-	const maxChars = 100_000
+	const maxChars = 200_000
 	if len(html) > maxChars {
 		// html = html[:maxChars]
 		log.Printf("html toooooo long, %d", len(html))
 	}
 
-	systemPrompt := "你是一名严谨的网页内容解析器。只输出一个合法 JSON 对象，不要输出任何多余字符，也不要使用 Markdown 代码块。JSON 必须严格符合 Readwise Reader 保存接口所需的字段与类型。"
+	systemPrompt := "你是一名严谨的网页内容解析器。只输出一个合法 JSON 对象，不要输出任何多余字符，也不要使用 Markdown 代码块。严禁在 JSON 中包含原始 HTML 或 Markdown 内容（不要返回 html 字段）。JSON 必须严格符合 Readwise Reader 保存接口所需的字段与类型。"
 	userPrompt := buildExtractionPrompt(url, html)
 	p.traceWrite(traceDir, "extract_prompt_system.txt", []byte(systemPrompt))
 	p.traceWrite(traceDir, "extract_prompt_user.txt", []byte(userPrompt))
@@ -255,7 +255,6 @@ func buildExtractionPrompt(url, html string) string {
 	sb.WriteString("【输出JSON字段定义】\n")
 	sb.WriteString("{\n")
 	sb.WriteString("  \"url\": string,\n")
-	sb.WriteString("  \"html\": string|null,\n")
 	sb.WriteString("  \"should_clean_html\": boolean,\n")
 	sb.WriteString("  \"title\": string|null,\n")
 	sb.WriteString("  \"author\": string|null,\n")
@@ -271,10 +270,9 @@ func buildExtractionPrompt(url, html string) string {
 
 	sb.WriteString("【提取规则】\n")
 	sb.WriteString("1. url：使用输入的URL\n")
-	sb.WriteString("2. html：提取完整的文章HTML内容，保持语义结构\n")
-	sb.WriteString("3. should_clean_html：设为true，让API自动清理HTML\n")
-	sb.WriteString("4. title：优先级：og:title > title标签 > h1标签 > 从内容推断\n")
-	sb.WriteString("5. author：优先级：og:article:author > meta[name=\"author\"] > byline文本 > 作者署名\n\n")
+	sb.WriteString("2. should_clean_html：设为true，让API自动清理HTML\n")
+	sb.WriteString("3. title：优先级：og:title > title标签 > h1标签 > 从内容推断\n")
+	sb.WriteString("4. author：优先级：og:article:author > meta[name=\"author\"] > byline文本 > 作者署名\n\n")
 
 	sb.WriteString("6. published_date（重要）：\n")
 	sb.WriteString("   a) 优先查找meta时间：article:published_time、publishdate、date 等\n")
@@ -294,12 +292,13 @@ func buildExtractionPrompt(url, html string) string {
 	sb.WriteString("【重要提醒】\n")
 	sb.WriteString("- published_date：当出现‘X月Y日Z:Z’时，年份必须使用当前年份；最终必须为+08:00的ISO8601\n")
 	sb.WriteString("- 所有URL转换为绝对URL\n")
-	sb.WriteString("- 不要臆造，不确定设为null\n\n")
+	sb.WriteString("- 不要臆造，不确定设为null\n")
+	sb.WriteString("- 严禁在输出JSON中包含原始HTML或Markdown内容（不要输出 html 字段）\n\n")
 
 	sb.WriteString("【输出要求】\n")
 	sb.WriteString("- 仅返回合法JSON对象，字段与类型严格符合Readwise Reader API\n")
 	sb.WriteString("- published_date为完整ISO8601(+08:00)或null\n")
-	sb.WriteString("- should_clean_html=true；location=\"new\"；saved_using=\"web_extractor\"\n")
+	sb.WriteString("- 不要包含 html 字段；should_clean_html=true；location=\"new\"；saved_using=\"web_extractor\"\n")
 	return sb.String()
 }
 
@@ -313,8 +312,9 @@ func (p *Processor) saveToReadwise(ctx context.Context, meta map[string]any, ori
 	if s, ok := toString(meta["url"]); ok {
 		body["url"] = s
 	}
-	if s, ok := toString(meta["html"]); ok && s != "" {
-		body["html"] = s
+	// Always include original fetched HTML for Reader cleaning
+	if hs := strings.TrimSpace(originalHTML); hs != "" {
+		body["html"] = hs
 	}
 	body["should_clean_html"] = toBool(meta["should_clean_html"], true)
 	if s, ok := toString(meta["title"]); ok {
@@ -328,9 +328,9 @@ func (p *Processor) saveToReadwise(ctx context.Context, meta map[string]any, ori
 			body["published_date"] = iso
 		}
 	}
-    if s, ok := toString(meta["image_url"]); ok {
-        body["image_url"] = s
-    }
+	if s, ok := toString(meta["image_url"]); ok {
+		body["image_url"] = s
+	}
 	if s, ok := toString(meta["summary"]); ok {
 		body["summary"] = s
 	}
@@ -363,45 +363,38 @@ func (p *Processor) saveToReadwise(ctx context.Context, meta map[string]any, ori
 		body["saved_using"] = "web_extractor"
 	}
 
-    // Ensure/derive image_url
-    baseURL, _ := toString(meta["url"])
-    if v, ok := body["image_url"]; ok {
-        s := toStringMust(v)
-        if s != "" && !isLikelyHTTPURL(s) {
-            if ru := resolveURL(baseURL, s); ru != "" {
-                body["image_url"] = ru
-            }
-        }
-    }
-    // Try meta og:image/twitter:image from original HTML
-    if _, ok := body["image_url"]; !ok || toStringMust(body["image_url"]) == "" {
-        if u := firstMetaImageURL(originalHTML); u != "" {
-            if ru := resolveURL(baseURL, u); ru != "" {
-                body["image_url"] = ru
-            } else {
-                body["image_url"] = u
-            }
-        }
-    }
-    // Fallback: if still missing, pick first image from article HTML
-    if _, ok := body["image_url"]; !ok || toStringMust(body["image_url"]) == "" {
-        // Prefer the article HTML returned by LLM; fallback to original fetched HTML
-        var articleHTML string
-        if s, ok := toString(meta["html"]); ok && s != "" {
-            articleHTML = s
-        } else {
-            articleHTML = originalHTML
-        }
-        if u := firstImageURL(articleHTML); u != "" {
-            if ru := resolveURL(baseURL, u); ru != "" {
-                body["image_url"] = ru
-            } else {
-                body["image_url"] = u
-            }
-        }
-    }
+	// Ensure/derive image_url
+	baseURL, _ := toString(meta["url"])
+	if v, ok := body["image_url"]; ok {
+		s := toStringMust(v)
+		if s != "" && !isLikelyHTTPURL(s) {
+			if ru := resolveURL(baseURL, s); ru != "" {
+				body["image_url"] = ru
+			}
+		}
+	}
+	// Try meta og:image/twitter:image from original HTML
+	if _, ok := body["image_url"]; !ok || toStringMust(body["image_url"]) == "" {
+		if u := firstMetaImageURL(originalHTML); u != "" {
+			if ru := resolveURL(baseURL, u); ru != "" {
+				body["image_url"] = ru
+			} else {
+				body["image_url"] = u
+			}
+		}
+	}
+	// Fallback: if still missing, pick first image from original HTML
+	if _, ok := body["image_url"]; !ok || toStringMust(body["image_url"]) == "" {
+		if u := firstImageURL(originalHTML); u != "" {
+			if ru := resolveURL(baseURL, u); ru != "" {
+				body["image_url"] = ru
+			} else {
+				body["image_url"] = u
+			}
+		}
+	}
 
-    b, _ := json.Marshal(body)
+	b, _ := json.Marshal(body)
 	p.traceWrite(traceDir, "readwise_request.json", b)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://readwise.io/api/v3/save/", bytes.NewReader(b))
 	req.Header.Set("Authorization", "Token "+token)
@@ -493,10 +486,10 @@ func toString(v any) (string, bool) {
 
 // toStringMust converts to string using toString, returns empty on failure.
 func toStringMust(v any) string {
-    if s, ok := toString(v); ok {
-        return s
-    }
-    return ""
+	if s, ok := toString(v); ok {
+		return s
+	}
+	return ""
 }
 
 func toBool(v any, def bool) bool {
@@ -583,204 +576,204 @@ func filterNotEmpty(in []string) []string {
 
 // isLikelyHTTPURL returns true if s starts with http:// or https://
 func isLikelyHTTPURL(s string) bool {
-    s = strings.TrimSpace(strings.ToLower(s))
-    return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+	s = strings.TrimSpace(strings.ToLower(s))
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
 // resolveURL resolves ref against base. Returns empty if cannot resolve.
 func resolveURL(base, ref string) string {
-    ref = strings.TrimSpace(ref)
-    if ref == "" {
-        return ""
-    }
-    if strings.HasPrefix(ref, "data:") || strings.HasPrefix(ref, "blob:") {
-        return ""
-    }
-    // Protocol-relative
-    if strings.HasPrefix(ref, "//") {
-        return "https:" + ref
-    }
-    // Already absolute
-    if isLikelyHTTPURL(ref) {
-        return ref
-    }
-    bu, err := url.Parse(base)
-    if err != nil || bu == nil {
-        return ""
-    }
-    ru, err := url.Parse(ref)
-    if err != nil || ru == nil {
-        return ""
-    }
-    return bu.ResolveReference(ru).String()
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return ""
+	}
+	if strings.HasPrefix(ref, "data:") || strings.HasPrefix(ref, "blob:") {
+		return ""
+	}
+	// Protocol-relative
+	if strings.HasPrefix(ref, "//") {
+		return "https:" + ref
+	}
+	// Already absolute
+	if isLikelyHTTPURL(ref) {
+		return ref
+	}
+	bu, err := url.Parse(base)
+	if err != nil || bu == nil {
+		return ""
+	}
+	ru, err := url.Parse(ref)
+	if err != nil || ru == nil {
+		return ""
+	}
+	return bu.ResolveReference(ru).String()
 }
 
 // firstImageURL tries to find the first <img> src or srcset URL in the html.
 // It returns the raw value (may be relative); caller should resolve to absolute.
 func firstImageURL(html string) string {
-    if strings.TrimSpace(html) == "" {
-        return ""
-    }
-    // Make a lowercase copy for searching while slicing from original
-    low := strings.ToLower(html)
-    i := 0
-    for {
-        idx := strings.Index(low[i:], "<img")
-        if idx < 0 {
-            break
-        }
-        // absolute position
-        pos := i + idx
-        // find end of tag
-        end := strings.IndexByte(low[pos:], '>')
-        if end < 0 {
-            break
-        }
-        endPos := pos + end
-        tag := html[pos : endPos+1]
-        tagLow := low[pos : endPos+1]
-        // Try src= first
-        if u := extractAttr(tag, tagLow, "src"); u != "" {
-            if isAcceptableImageURL(u) {
-                return u
-            }
-        }
-        // Try data-src (lazy load)
-        if u := extractAttr(tag, tagLow, "data-src"); u != "" {
-            if isAcceptableImageURL(u) {
-                return u
-            }
-        }
-        // Try data-original
-        if u := extractAttr(tag, tagLow, "data-original"); u != "" {
-            if isAcceptableImageURL(u) {
-                return u
-            }
-        }
-        // Try srcset: choose the first URL before whitespace/comma
-        if ss := extractAttr(tag, tagLow, "srcset"); ss != "" {
-            // srcset entries are like: "url1 1x, url2 2x"
-            comma := strings.Index(ss, ",")
-            if comma >= 0 {
-                ss = ss[:comma]
-            }
-            // take up to first whitespace
-            for j := 0; j < len(ss); j++ {
-                if ss[j] == ' ' || ss[j] == '\t' || ss[j] == '\n' {
-                    ss = ss[:j]
-                    break
-                }
-            }
-            if isAcceptableImageURL(ss) {
-                return ss
-            }
-        }
-        // advance
-        i = endPos + 1
-    }
-    return ""
+	if strings.TrimSpace(html) == "" {
+		return ""
+	}
+	// Make a lowercase copy for searching while slicing from original
+	low := strings.ToLower(html)
+	i := 0
+	for {
+		idx := strings.Index(low[i:], "<img")
+		if idx < 0 {
+			break
+		}
+		// absolute position
+		pos := i + idx
+		// find end of tag
+		end := strings.IndexByte(low[pos:], '>')
+		if end < 0 {
+			break
+		}
+		endPos := pos + end
+		tag := html[pos : endPos+1]
+		tagLow := low[pos : endPos+1]
+		// Try src= first
+		if u := extractAttr(tag, tagLow, "src"); u != "" {
+			if isAcceptableImageURL(u) {
+				return u
+			}
+		}
+		// Try data-src (lazy load)
+		if u := extractAttr(tag, tagLow, "data-src"); u != "" {
+			if isAcceptableImageURL(u) {
+				return u
+			}
+		}
+		// Try data-original
+		if u := extractAttr(tag, tagLow, "data-original"); u != "" {
+			if isAcceptableImageURL(u) {
+				return u
+			}
+		}
+		// Try srcset: choose the first URL before whitespace/comma
+		if ss := extractAttr(tag, tagLow, "srcset"); ss != "" {
+			// srcset entries are like: "url1 1x, url2 2x"
+			comma := strings.Index(ss, ",")
+			if comma >= 0 {
+				ss = ss[:comma]
+			}
+			// take up to first whitespace
+			for j := 0; j < len(ss); j++ {
+				if ss[j] == ' ' || ss[j] == '\t' || ss[j] == '\n' {
+					ss = ss[:j]
+					break
+				}
+			}
+			if isAcceptableImageURL(ss) {
+				return ss
+			}
+		}
+		// advance
+		i = endPos + 1
+	}
+	return ""
 }
 
 // extractAttr gets attribute value from a single tag string; tagLow must be lowercase of tag.
 func extractAttr(tag, tagLow, name string) string {
-    // try with optional whitespace around '=' by scanning for name and then skipping spaces
-    start := 0
-    for {
-        idx := strings.Index(tagLow[start:], name)
-        if idx < 0 {
-            return ""
-        }
-        idx += start
-        // ensure boundary (prev not letter)
-        if idx > 0 {
-            prev := tagLow[idx-1]
-            if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '-' || prev == '_' {
-                start = idx + len(name)
-                continue
-            }
-        }
-        k := idx + len(name)
-        // skip spaces
-        for k < len(tagLow) && (tagLow[k] == ' ' || tagLow[k] == '\t' || tagLow[k] == '\n') {
-            k++
-        }
-        if k >= len(tagLow) || tagLow[k] != '=' {
-            start = idx + len(name)
-            continue
-        }
-        k++ // skip '='
-        for k < len(tagLow) && (tagLow[k] == ' ' || tagLow[k] == '\t' || tagLow[k] == '\n') {
-            k++
-        }
-        if k >= len(tag) {
-            return ""
-        }
-        // quote or unquoted
-        q := tag[k]
-        if q == '\'' || q == '"' {
-            k++
-            vstart := k
-            for k < len(tag) && tag[k] != q {
-                k++
-            }
-            if k <= len(tag) {
-                return html.UnescapeString(strings.TrimSpace(tag[vstart:k]))
-            }
-            return ""
-        }
-        // unquoted: read until space/>
-        vstart := k
-        for k < len(tag) && tag[k] != ' ' && tag[k] != '\t' && tag[k] != '\n' && tag[k] != '>' {
-            k++
-        }
-        return html.UnescapeString(strings.TrimSpace(tag[vstart:k]))
-    }
+	// try with optional whitespace around '=' by scanning for name and then skipping spaces
+	start := 0
+	for {
+		idx := strings.Index(tagLow[start:], name)
+		if idx < 0 {
+			return ""
+		}
+		idx += start
+		// ensure boundary (prev not letter)
+		if idx > 0 {
+			prev := tagLow[idx-1]
+			if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '-' || prev == '_' {
+				start = idx + len(name)
+				continue
+			}
+		}
+		k := idx + len(name)
+		// skip spaces
+		for k < len(tagLow) && (tagLow[k] == ' ' || tagLow[k] == '\t' || tagLow[k] == '\n') {
+			k++
+		}
+		if k >= len(tagLow) || tagLow[k] != '=' {
+			start = idx + len(name)
+			continue
+		}
+		k++ // skip '='
+		for k < len(tagLow) && (tagLow[k] == ' ' || tagLow[k] == '\t' || tagLow[k] == '\n') {
+			k++
+		}
+		if k >= len(tag) {
+			return ""
+		}
+		// quote or unquoted
+		q := tag[k]
+		if q == '\'' || q == '"' {
+			k++
+			vstart := k
+			for k < len(tag) && tag[k] != q {
+				k++
+			}
+			if k <= len(tag) {
+				return html.UnescapeString(strings.TrimSpace(tag[vstart:k]))
+			}
+			return ""
+		}
+		// unquoted: read until space/>
+		vstart := k
+		for k < len(tag) && tag[k] != ' ' && tag[k] != '\t' && tag[k] != '\n' && tag[k] != '>' {
+			k++
+		}
+		return html.UnescapeString(strings.TrimSpace(tag[vstart:k]))
+	}
 }
 
 func isAcceptableImageURL(u string) bool {
-    if u == "" {
-        return false
-    }
-    ul := strings.ToLower(strings.TrimSpace(u))
-    if strings.HasPrefix(ul, "data:") || strings.HasPrefix(ul, "blob:") {
-        return false
-    }
-    return true
+	if u == "" {
+		return false
+	}
+	ul := strings.ToLower(strings.TrimSpace(u))
+	if strings.HasPrefix(ul, "data:") || strings.HasPrefix(ul, "blob:") {
+		return false
+	}
+	return true
 }
 
 // firstMetaImageURL finds <meta property="og:image" content="..."> or
 // <meta name="twitter:image" content="..."> in the HTML head/body.
 func firstMetaImageURL(html string) string {
-    if strings.TrimSpace(html) == "" {
-        return ""
-    }
-    low := strings.ToLower(html)
-    i := 0
-    for {
-        idx := strings.Index(low[i:], "<meta")
-        if idx < 0 {
-            break
-        }
-        pos := i + idx
-        end := strings.IndexByte(low[pos:], '>')
-        if end < 0 {
-            break
-        }
-        endPos := pos + end
-        tag := html[pos : endPos+1]
-        tagLow := low[pos : endPos+1]
-        prop := strings.ToLower(extractAttr(tag, tagLow, "property"))
-        name := strings.ToLower(extractAttr(tag, tagLow, "name"))
-        if prop == "og:image" || prop == "og:image:url" || name == "twitter:image" || prop == "twitter:image" {
-            if c := extractAttr(tag, tagLow, "content"); c != "" {
-                if isAcceptableImageURL(c) {
-                    return c
-                }
-            }
-        }
-        i = endPos + 1
-    }
-    return ""
+	if strings.TrimSpace(html) == "" {
+		return ""
+	}
+	low := strings.ToLower(html)
+	i := 0
+	for {
+		idx := strings.Index(low[i:], "<meta")
+		if idx < 0 {
+			break
+		}
+		pos := i + idx
+		end := strings.IndexByte(low[pos:], '>')
+		if end < 0 {
+			break
+		}
+		endPos := pos + end
+		tag := html[pos : endPos+1]
+		tagLow := low[pos : endPos+1]
+		prop := strings.ToLower(extractAttr(tag, tagLow, "property"))
+		name := strings.ToLower(extractAttr(tag, tagLow, "name"))
+		if prop == "og:image" || prop == "og:image:url" || name == "twitter:image" || prop == "twitter:image" {
+			if c := extractAttr(tag, tagLow, "content"); c != "" {
+				if isAcceptableImageURL(c) {
+					return c
+				}
+			}
+		}
+		i = endPos + 1
+	}
+	return ""
 }
 
 // normalizePublishedDateChina parses a variety of date/time formats and
@@ -1013,9 +1006,6 @@ func buildReadwiseBody(meta map[string]any) map[string]any {
 	body := make(map[string]any)
 	if s, ok := toString(meta["url"]); ok {
 		body["url"] = s
-	}
-	if s, ok := toString(meta["html"]); ok && s != "" {
-		body["html"] = s
 	}
 	body["should_clean_html"] = toBool(meta["should_clean_html"], true)
 	if s, ok := toString(meta["title"]); ok {
