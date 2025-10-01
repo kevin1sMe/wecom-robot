@@ -49,15 +49,18 @@ func NewProcessor(cfg *config.Config) *Processor {
 
 // ProcessURL runs the full pipeline asynchronously-safe. Logs errors; no panics.
 func (p *Processor) ProcessURL(ctx context.Context, url string) {
-	start := time.Now()
-	job := hashURL(url)
-	jobShort := job
-	if len(jobShort) > 8 {
-		jobShort = jobShort[:8]
-	}
-	traceDir := p.makeTraceDir(url)
-	p.traceWrite(traceDir, "url.txt", []byte(strings.TrimSpace(url)))
-	p.traceWrite(traceDir, "job.txt", []byte(jobShort))
+    start := time.Now()
+    job := hashURL(url)
+    jobShort := job
+    if len(jobShort) > 8 {
+        jobShort = jobShort[:8]
+    }
+    traceDir := p.makeTraceDir(url)
+    if traceDir != "" {
+        log.Printf("[reader] job=%s trace_dir=%s", jobShort, traceDir)
+    }
+    p.traceWrite(traceDir, "url.txt", []byte(strings.TrimSpace(url)))
+    p.traceWrite(traceDir, "job.txt", []byte(jobShort))
 
 	log.Printf("[reader] job=%s step=process event=start url=%s", jobShort, url)
 
