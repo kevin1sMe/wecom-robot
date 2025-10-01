@@ -148,7 +148,7 @@ func (p *Processor) fetchHTML(ctx context.Context, url string) (string, bool, er
 
 // fetchViaMCPHTTP calls a remote MCP HTTP server tool (default tool "http") with {url, method}
 func (p *Processor) fetchViaMCPHTTP(ctx context.Context, url string) (string, error) {
-	cli := mcpclient.New(p.cfg.MCPHTTPURL, p.cfg.MCPToolName)
+	cli := mcpclient.New(p.cfg.MCPHTTPURL, p.cfg.MCPToolName, p.cfg.MCPAuthToken)
 	return cli.FetchURL(ctx, url)
 }
 

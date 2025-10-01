@@ -21,6 +21,8 @@ type Config struct {
 	// MCP HTTP server (streamable-http) for fetching
 	MCPHTTPURL  string // e.g., http://localhost:8080/mcp
 	MCPToolName string // e.g., "http"
+	// Optional bearer auth for MCP server
+	MCPAuthToken string // env: MCP_AUTH_TOKEN (Authorization: Bearer <token>)
 
 	// Readwise Reader
 	ReadwiseToken string
@@ -49,6 +51,7 @@ func FromEnv() (*Config, error) {
 		LLMModel:       firstNonEmpty(os.Getenv("LLM_MODEL"), os.Getenv("EXAMPLE_MODEL_NAME")),
 		MCPHTTPURL:     os.Getenv("MCP_HTTP_URL"),
 		MCPToolName:    os.Getenv("MCP_TOOL_NAME"),
+		MCPAuthToken:   os.Getenv("MCP_AUTH_TOKEN"),
 		ReadwiseToken:  os.Getenv("READWISE_API_TOKEN"),
 		ReaderCacheDir: os.Getenv("READER_CACHE_DIR"),
 		ReaderLogDir:   os.Getenv("READER_LOG_DIR"),

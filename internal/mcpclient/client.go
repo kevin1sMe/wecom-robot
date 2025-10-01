@@ -17,14 +17,16 @@ import (
 type Client struct {
 	Endpoint string
 	ToolName string
+	// Optional bearer token. If set, we send Authorization: Bearer <token>
+	AuthToken string
 }
 
 // New returns a new Client.
-func New(endpoint, toolName string) *Client {
+func New(endpoint, toolName string, authToken string) *Client {
 	if toolName == "" {
 		toolName = "http"
 	}
-	return &Client{Endpoint: endpoint, ToolName: toolName}
+	return &Client{Endpoint: endpoint, ToolName: toolName, AuthToken: strings.TrimSpace(authToken)}
 }
 
 // FetchURL invokes the MCP tool with { url, method: GET } and returns aggregated text content.
@@ -32,7 +34,19 @@ func (c *Client) FetchURL(ctx context.Context, url string) (string, error) {
 	if c.Endpoint == "" {
 		return "", errors.New("empty MCP endpoint")
 	}
-	trans, err := transport.NewStreamableHTTP(c.Endpoint, transport.WithHTTPTimeout(params.MCPTransportTimeout))
+	opts := []transport.StreamableHTTPCOption{transport.WithHTTPTimeout(params.MCPTransportTimeout)}
+	if tok := strings.TrimSpace(c.AuthToken); tok != "" {
+		// Only prefix Bearer if not already provided
+		hdr := tok
+		low := strings.ToLower(tok)
+		if !strings.HasPrefix(low, "bearer ") {
+			hdr = "Bearer " + tok
+		}
+		opts = append(opts, transport.WithHTTPHeaders(map[string]string{
+			"Authorization": hdr,
+		}))
+	}
+	trans, err := transport.NewStreamableHTTP(c.Endpoint, opts...)
 	if err != nil {
 		return "", fmt.Errorf("new streamable http: %w", err)
 	}
