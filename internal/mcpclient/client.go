@@ -7,13 +7,21 @@ import (
 	"fmt"
 	"strings"
 
+	"wecom-robot/internal/params"
+
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	mcp "github.com/mark3labs/mcp-go/mcp"
-	"wecom-robot/internal/params"
 )
 
-// Client wraps an MCP HTTP endpoint and a tool name (default "http").
+// Page contains both HTML content and structured metadata from MCP response.
+type Page struct {
+	URL      string         `json:"url"`      // The URL of the page
+	HTML     string         `json:"html"`     // The HTML content
+	Metadata map[string]any `json:"metadata"` // Extracted metadata (title, author, published_date, etc.)
+}
+
+// Client wraps an MCP HTTP endpoint and tool name (only "scrape_wechat_article" is supported).
 type Client struct {
 	Endpoint string
 	ToolName string
@@ -24,15 +32,15 @@ type Client struct {
 // New returns a new Client.
 func New(endpoint, toolName string, authToken string) *Client {
 	if toolName == "" {
-		toolName = "http"
+		toolName = "scrape_wechat_article"
 	}
 	return &Client{Endpoint: endpoint, ToolName: toolName, AuthToken: strings.TrimSpace(authToken)}
 }
 
-// FetchURL invokes the MCP tool with { url, method: GET } and returns aggregated text content.
-func (c *Client) FetchURL(ctx context.Context, url string) (string, error) {
+// FetchURL invokes the scrape_wechat_article MCP tool and returns HTML and metadata.
+func (c *Client) FetchURL(ctx context.Context, url string) (*Page, error) {
 	if c.Endpoint == "" {
-		return "", errors.New("empty MCP endpoint")
+		return nil, errors.New("empty MCP endpoint")
 	}
 	opts := []transport.StreamableHTTPCOption{transport.WithHTTPTimeout(params.MCPTransportTimeout)}
 	if tok := strings.TrimSpace(c.AuthToken); tok != "" {
@@ -48,7 +56,7 @@ func (c *Client) FetchURL(ctx context.Context, url string) (string, error) {
 	}
 	trans, err := transport.NewStreamableHTTP(c.Endpoint, opts...)
 	if err != nil {
-		return "", fmt.Errorf("new streamable http: %w", err)
+		return nil, fmt.Errorf("new streamable http: %w", err)
 	}
 	cli := mcpclient.NewClient(trans)
 	// ensure we have a reasonable timeout if caller didn't set one
@@ -58,9 +66,14 @@ func (c *Client) FetchURL(ctx context.Context, url string) (string, error) {
 		defer cancel()
 	}
 	if err := cli.Start(ctx); err != nil {
-		return "", fmt.Errorf("mcp start: %w", err)
+		return nil, fmt.Errorf("mcp start: %w", err)
 	}
 	defer func() { _ = cli.Close() }()
+
+	// Only support scrape_wechat_article tool
+	if strings.ToLower(c.ToolName) != "scrape_wechat_article" {
+		return nil, fmt.Errorf("unsupported MCP tool: %s (only scrape_wechat_article is supported)", c.ToolName)
+	}
 
 	if _, err := cli.Initialize(ctx, mcp.InitializeRequest{
 		Params: mcp.InitializeParams{
@@ -69,26 +82,16 @@ func (c *Client) FetchURL(ctx context.Context, url string) (string, error) {
 			Capabilities:    mcp.ClientCapabilities{},
 		},
 	}); err != nil {
-		return "", fmt.Errorf("mcp initialize: %w", err)
+		return nil, fmt.Errorf("mcp initialize: %w", err)
 	}
 
-	// Build arguments based on known tool conventions
-	var args any
-	switch strings.ToLower(c.ToolName) {
-	case "", "http":
-		args = map[string]any{"url": url, "method": "GET"}
-	case "scrape_wechat_article":
-		// See provided tool schema: we request only HTML for our pipeline
-		args = map[string]any{
-			"url":          url,
-			"formats":      []string{"html"},
-			"sessionTTL":   180,
-			"proxyCountry": "CN",
-			// sessionName: omitted by default
-		}
-	default:
-		// Best-effort: send url only
-		args = map[string]any{"url": url}
+	// Build arguments for scrape_wechat_article tool (per DOCS.md)
+	args := map[string]any{
+		"url":          url,
+		"formats":      []string{"html"},
+		"sessionTTL":   180,
+		"proxyCountry": "CN",
+		// sessionName: omitted by default
 	}
 
 	result, err := cli.CallTool(ctx, mcp.CallToolRequest{
@@ -98,163 +101,81 @@ func (c *Client) FetchURL(ctx context.Context, url string) (string, error) {
 		},
 	})
 	if err != nil {
-		return "", fmt.Errorf("mcp call tool: %w", err)
+		return nil, fmt.Errorf("mcp call tool: %w", err)
 	}
-	// Prefer structuredContent.html when available (especially for scrape_wechat_article)
-	if result != nil && result.StructuredContent != nil {
-		if m, ok := result.StructuredContent.(map[string]any); ok {
-			if s := extractHTMLFromMap(m); s != "" {
-				return s, nil
-			}
-		} else {
-			if b, err := json.Marshal(result.StructuredContent); err == nil {
-				var mv map[string]any
-				if json.Unmarshal(b, &mv) == nil {
-					if s := extractHTMLFromMap(mv); s != "" {
-						return s, nil
-					}
-				}
-			}
-		}
-	}
-	// Then try typed content
-	if result != nil && len(result.Content) > 0 {
-		var sb strings.Builder
-		for _, part := range result.Content {
-			switch v := part.(type) {
-			case mcp.TextContent:
-				sb.WriteString(v.Text)
-			default:
-				// ignore non-text parts here
-			}
-		}
-		if sb.Len() > 0 {
-			s := sb.String()
-			// If the tool returned a JSON envelope, try extract `html` field
-			st := strings.TrimSpace(s)
-			if len(st) > 0 && (st[0] == '{' || st[0] == '[') {
-				if h, ok := extractHTMLFromJSON(st); ok && h != "" {
-					return h, nil
-				}
-			}
-			return s, nil
-		}
-	}
-	// Fallback to JSON parse
-	b, err := json.Marshal(result)
-	if err != nil {
-		return "", fmt.Errorf("marshal result: %w", err)
-	}
-	var v map[string]any
-	if err := json.Unmarshal(b, &v); err != nil {
-		return string(b), nil
-	}
-	if s := extractHTMLFromMap(v); s != "" {
-		return s, nil
-	}
-	if s := extractTextFromMap(v); s != "" {
-		return s, nil
-	}
-	return string(b), nil
+
+	// Handle scrape_wechat_article deterministic structure (see DOCS.md)
+	return extractPageFromWechatScraper(url, result)
 }
 
-func extractTextFromMap(m map[string]any) string {
-	// Prefer explicit HTML if present
-	if s, ok := m["html"].(string); ok && s != "" {
-		return s
-	}
-	if c, ok := m["content"].([]any); ok {
-		if s := collectText(c); s != "" {
-			return s
-		}
-	}
-	if result, ok := m["result"].(map[string]any); ok {
-		if s, ok := result["html"].(string); ok && s != "" {
-			return s
-		}
-		if c, ok := result["content"].([]any); ok {
-			if s := collectText(c); s != "" {
-				return s
+// extractPageFromWechatScraper handles the deterministic structure from scrape_wechat_article tool.
+// Per DOCS.md:
+//
+//	Success: content[{type: 'text', text: <JSON string with {status, url, metadata, html, ...}>}]
+//	Error: content[{type: 'text', text: 'error message'}], isError: true
+func extractPageFromWechatScraper(url string, result *mcp.CallToolResult) (*Page, error) {
+	// Check for error response
+	if result.IsError {
+		errMsg := "scrape_wechat_article returned error"
+		if len(result.Content) > 0 {
+			if tc, ok := result.Content[0].(mcp.TextContent); ok && tc.Text != "" {
+				errMsg = tc.Text
 			}
 		}
-		if s, ok := result["content"].(string); ok && s != "" {
-			return s
-		}
+		return nil, fmt.Errorf("%s", errMsg)
 	}
-	if s, ok := m["text"].(string); ok && s != "" {
-		return s
-	}
-	if s, ok := m["value"].(string); ok && s != "" {
-		return s
-	}
-	return ""
-}
 
-func collectText(parts []any) string {
-	var sb strings.Builder
-	for _, it := range parts {
-		if m, ok := it.(map[string]any); ok {
-			if t, _ := m["type"].(string); t != "" {
-				switch t {
-				case "text", "string", "log":
-					if s, _ := m["text"].(string); s != "" {
-						sb.WriteString(s)
-					}
-					if s, _ := m["value"].(string); s != "" {
-						sb.WriteString(s)
-					}
-				case "text_delta", "text-delta", "delta":
-					if s, _ := m["text"].(string); s != "" {
-						sb.WriteString(s)
-					}
-					if s, _ := m["delta"].(string); s != "" {
-						sb.WriteString(s)
-					}
-				}
-			} else {
-				if s, _ := m["text"].(string); s != "" {
-					sb.WriteString(s)
-				}
-				if s, _ := m["value"].(string); s != "" {
-					sb.WriteString(s)
-				}
-			}
-		}
+	// Extract text content from MCP response
+	if len(result.Content) == 0 {
+		return nil, errors.New("empty content from scrape_wechat_article")
 	}
-	return sb.String()
-}
 
-// extractHTMLFromJSON attempts to parse a JSON string and locate a string field named "html".
-func extractHTMLFromJSON(s string) (string, bool) {
-	var v map[string]any
-	if err := json.Unmarshal([]byte(s), &v); err != nil {
-		return "", false
+	var textContent string
+	for _, part := range result.Content {
+		if tc, ok := part.(mcp.TextContent); ok {
+			textContent = tc.Text
+			break
+		}
 	}
-	if h := extractHTMLFromMap(v); h != "" {
-		return h, true
+	if textContent == "" {
+		return nil, errors.New("no text content in scrape_wechat_article response")
 	}
-	return "", false
-}
 
-// extractHTMLFromMap searches common locations for an HTML payload.
-func extractHTMLFromMap(m map[string]any) string {
-	if s, ok := m["html"].(string); ok && strings.TrimSpace(s) != "" {
-		return s
+	// Parse the JSON payload (the inner JSON structure)
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(textContent), &payload); err != nil {
+		return nil, fmt.Errorf("parse scrape_wechat_article JSON: %w", err)
 	}
-	if result, ok := m["result"].(map[string]any); ok {
-		if s, ok := result["html"].(string); ok && strings.TrimSpace(s) != "" {
-			return s
+
+	// Extract HTML from payload
+	html, _ := payload["html"].(string)
+	if html == "" {
+		return nil, errors.New("no html field in scrape_wechat_article response")
+	}
+
+	// Extract metadata from payload
+	metadata := make(map[string]any)
+	if metaMap, ok := payload["metadata"].(map[string]any); ok {
+		// Copy all metadata fields
+		for k, v := range metaMap {
+			metadata[k] = v
 		}
 	}
-	if sc, ok := m["structuredContent"].(map[string]any); ok {
-		if s, ok := sc["html"].(string); ok && strings.TrimSpace(s) != "" {
-			return s
-		}
+
+	// Also preserve top-level fields for traceability
+	if url, ok := payload["url"].(string); ok && url != "" {
+		metadata["source_url"] = url
 	}
-	if data, ok := m["data"].(map[string]any); ok {
-		if s, ok := data["html"].(string); ok && strings.TrimSpace(s) != "" {
-			return s
-		}
+	if ts, ok := payload["timestamp"].(string); ok && ts != "" {
+		metadata["fetch_timestamp"] = ts
 	}
-	return ""
+	if status, ok := payload["status"].(string); ok && status != "" {
+		metadata["fetch_status"] = status
+	}
+
+	return &Page{
+		URL:      url,
+		HTML:     html,
+		Metadata: metadata,
+	}, nil
 }

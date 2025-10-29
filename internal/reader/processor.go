@@ -27,6 +27,24 @@ import (
 	"github.com/openai/openai-go/shared"
 )
 
+// ReadwiseDocument represents the structured data for Readwise Reader API.
+// See: https://readwise.io/reader_api
+type ReadwiseDocument struct {
+	URL             string   `json:"url"`                      // Required: the URL of the article
+	HTML            string   `json:"html,omitempty"`           // Optional: raw HTML content
+	ShouldCleanHTML bool     `json:"should_clean_html"`        // Whether Readwise should clean the HTML
+	Title           string   `json:"title,omitempty"`          // Optional: article title
+	Author          string   `json:"author,omitempty"`         // Optional: author name
+	PublishedDate   string   `json:"published_date,omitempty"` // Optional: ISO 8601 date string
+	ImageURL        string   `json:"image_url,omitempty"`      // Optional: cover image URL
+	Summary         string   `json:"summary,omitempty"`        // Optional: article summary
+	Category        string   `json:"category,omitempty"`       // Optional: article|email|rss|highlight|note|pdf|epub|tweet|video
+	Tags            []string `json:"tags,omitempty"`           // Optional: array of tag strings
+	Notes           string   `json:"notes,omitempty"`          // Optional: user notes
+	Location        string   `json:"location,omitempty"`       // Optional: new|later|archive|feed
+	SavedUsing      string   `json:"saved_using,omitempty"`    // Optional: source identifier
+}
+
 // Processor coordinates: fetch via MCP streamable HTTP -> LLM extract -> Readwise save
 type Processor struct {
 	cfg *config.Config
@@ -64,48 +82,57 @@ func (p *Processor) ProcessURL(ctx context.Context, url string) {
 
 	log.Printf("[reader] job=%s step=process event=start url=%s", jobShort, url)
 
-	// Step: fetch HTML (<= 5m)
+	// Step: fetch page from MCP (<= 5m)
 	stepFetchStart := time.Now()
-	log.Printf("[reader] job=%s step=fetch_html event=start", jobShort)
+	log.Printf("[reader] job=%s step=fetch_page event=start", jobShort)
 	ctxFetch, cancelFetch := context.WithTimeout(ctx, params.StepTimeout)
-	html, fromCache, err := p.fetchHTML(ctxFetch, url)
+	page, fromCache, err := p.fetchPage(ctxFetch, url, jobShort)
 	cancelFetch()
 	if err != nil {
-		log.Printf("[reader] job=%s step=fetch_html event=error err=%v", jobShort, err)
-		p.traceWrite(traceDir, "error.txt", []byte("fetch: "+err.Error()))
+		log.Printf("[reader] job=%s step=fetch_page event=error err=%v", jobShort, err)
+		p.traceWrite(traceDir, "error_fetch.txt", []byte(err.Error()))
 		return
 	}
 	p.traceWrite(traceDir, "fetch_source.txt", []byte(map[bool]string{true: "cache", false: "mcp"}[fromCache]))
-	p.traceWrite(traceDir, "fetch.html", []byte(html))
-	log.Printf("[reader] job=%s step=fetch_html event=end from_cache=%t bytes=%d dur=%s", jobShort, fromCache, len(html), time.Since(stepFetchStart))
+	// 保存完整的 page 对象到 page.json
+	if pageJSON, err := json.MarshalIndent(page, "", "  "); err == nil {
+		p.traceWrite(traceDir, "page.json", pageJSON)
+	}
+	log.Printf("[reader] job=%s step=fetch_page event=end from_cache=%t html_bytes=%d metadata_keys=%d dur=%s",
+		jobShort, fromCache, len(page.HTML), len(page.Metadata), time.Since(stepFetchStart))
 
-	// Step: extract metadata (<= 5m) and receive Readwise-ready body
+	// Step: extract/merge metadata (<= 5m) and build Readwise document
 	stepExtractStart := time.Now()
 	log.Printf("[reader] job=%s step=extract_meta event=start", jobShort)
 	ctxExtract, cancelExtract := context.WithTimeout(ctx, params.StepTimeout)
-	body, metaFromCache, err := p.extractMetadata(ctxExtract, html, url, traceDir)
+	doc, metaFromCache, err := p.extractMetadata(ctxExtract, page, traceDir, jobShort)
 	cancelExtract()
 	if err != nil {
 		log.Printf("[reader] job=%s step=extract_meta event=error err=%v", jobShort, err)
-		p.traceWrite(traceDir, "error.txt", []byte("extract: "+err.Error()))
+		p.traceWrite(traceDir, "error_extract.txt", []byte(err.Error()))
 		return
 	}
-	// quick body size for visibility
-	var bodyBytes int
-	if b, _ := json.Marshal(body); len(b) > 0 {
-		bodyBytes = len(b)
+
+	// 追加上html部分
+	doc.HTML = page.HTML
+
+	// quick doc size for visibility
+	var docBytes int
+	if b, _ := json.Marshal(doc); len(b) > 0 {
+		docBytes = len(b)
 	}
-	log.Printf("[reader] job=%s step=extract_meta event=end from_cache=%t keys=%d bytes=%d dur=%s", jobShort, metaFromCache, len(body), bodyBytes, time.Since(stepExtractStart))
+	log.Printf("[reader] job=%s step=extract_meta event=end from_cache=%t title=%q bytes=%d dur=%s",
+		jobShort, metaFromCache, doc.Title, docBytes, time.Since(stepExtractStart))
 
 	// Step: save to Readwise (<= 5m)
 	stepSaveStart := time.Now()
 	log.Printf("[reader] job=%s step=save_readwise event=start", jobShort)
 	ctxSave, cancelSave := context.WithTimeout(ctx, params.StepTimeout)
 	defer cancelSave()
-	link, err := p.saveToReadwise(ctxSave, body, html, traceDir)
+	link, err := p.saveToReadwise(ctxSave, doc, traceDir)
 	if err != nil {
 		log.Printf("[reader] job=%s step=save_readwise event=error err=%v", jobShort, err)
-		p.traceWrite(traceDir, "error.txt", []byte("readwise: "+err.Error()))
+		p.traceWrite(traceDir, "error_readwise.txt", []byte(err.Error()))
 		return
 	}
 	if strings.TrimSpace(link) != "" {
@@ -117,67 +144,133 @@ func (p *Processor) ProcessURL(ctx context.Context, url string) {
 	log.Printf("[reader] job=%s step=process event=end url=%s dur=%s", jobShort, url, time.Since(start))
 }
 
-// fetchHTML fetches content strictly via MCP HTTP server (streamable-http).
-func (p *Processor) fetchHTML(ctx context.Context, url string) (string, bool, error) {
+// fetchPage fetches a web page strictly via MCP HTTP server (streamable-http).
+// Returns Page containing both HTML and metadata extracted by MCP.
+func (p *Processor) fetchPage(ctx context.Context, url string, jobShort string) (*mcpclient.Page, bool, error) {
 	url = strings.TrimSpace(url)
 	if p.cfg.MCPHTTPURL == "" {
-		return "", false, errors.New("MCP_HTTP_URL 未配置；本服务仅通过 MCP streamable http 抓取，不支持直接 HTTP")
+		return nil, false, errors.New("MCP_HTTP_URL 未配置；本服务仅通过 MCP streamable http 抓取，不支持直接 HTTP")
 	}
-	// Try Redis/file cache first
-	if cached, ok := p.tryReadCache(ctx, url); ok {
-		log.Printf("[reader] cache hit for url=%s", url)
-		return cached, true, nil
+	// Try to read complete Page from cache (includes HTML + metadata)
+	if cachedPage, ok := p.tryReadPageCache(ctx, url); ok {
+		log.Printf("[reader] job=%s step=fetch_page event=cache_hit", jobShort)
+		return cachedPage, true, nil
 	}
-	log.Printf("[reader] cache miss for url=%s", url)
+	log.Printf("[reader] job=%s step=fetch_page event=cache_miss", jobShort)
 
-	html, err := p.fetchViaMCPHTTP(ctx, url)
+	// Fetch from MCP
+	log.Printf("[reader] job=%s step=fetch_page event=mcp_call", jobShort)
+	page, err := p.fetchViaMCPHTTP(ctx, url)
 	if err != nil {
-		return "", false, fmt.Errorf("mcp fetch: %w", err)
+		return nil, false, fmt.Errorf("mcp fetch: %w", err)
 	}
-	if html == "" {
-		return "", false, errors.New("mcp fetch 返回空内容")
+	if page.HTML == "" {
+		return nil, false, errors.New("mcp fetch 返回空内容")
 	}
-	// Write cache best-effort (Redis then file)
-	if err := p.writeCache(ctx, url, html); err != nil {
-		log.Printf("[reader] cache write failed: %v", err)
+
+	// Write complete Page to cache (best-effort)
+	if err := p.writePageCache(ctx, url, page); err != nil {
+		log.Printf("[reader] job=%s step=fetch_page event=cache_write_error err=%v", jobShort, err)
 	}
-	return html, false, nil
+	return page, false, nil
 }
 
 // NOTE: direct HTTP fetching is intentionally disabled per requirements.
 
 // fetchViaMCPHTTP calls a remote MCP HTTP server tool (default tool "http") with {url, method}
-func (p *Processor) fetchViaMCPHTTP(ctx context.Context, url string) (string, error) {
+func (p *Processor) fetchViaMCPHTTP(ctx context.Context, url string) (*mcpclient.Page, error) {
 	cli := mcpclient.New(p.cfg.MCPHTTPURL, p.cfg.MCPToolName, p.cfg.MCPAuthToken)
 	return cli.FetchURL(ctx, url)
 }
 
-// extractMetadata asks the LLM to return a strict JSON object as metadata
-// extractMetadata returns a Readwise-ready body map. It encapsulates LLM extraction
-// and local caching (like fetchHTML), and writes trace logs.
-func (p *Processor) extractMetadata(ctx context.Context, html, url, traceDir string) (map[string]any, bool, error) {
-	if p.cfg.LLMBaseURL == "" || p.cfg.LLMAPIKey == "" || p.cfg.LLMModel == "" {
-		return nil, false, errors.New("LLM config missing (LLM_BASE_URL, LLM_API_KEY, LLM_MODEL)")
+// extractMetadata builds a ReadwiseDocument from the Page's metadata and HTML.
+// It prioritizes MCP metadata, and skips LLM extraction if metadata is sufficient.
+// Returns a Readwise-ready document and whether metadata came from cache.
+func (p *Processor) extractMetadata(ctx context.Context, page *mcpclient.Page, traceDir string, jobShort string) (*ReadwiseDocument, bool, error) {
+	// 尝试加载缓存
+	if cachedDoc, ok := p.tryReadMetaCache(ctx, page.URL); ok {
+		log.Printf("[reader] job=%s step=extract_meta event=cache_hit", jobShort)
+		return cachedDoc, true, nil
 	}
+	log.Printf("[reader] job=%s step=extract_meta event=cache_miss", jobShort)
+
+	// 优先使用 LLM 提取
+	log.Printf("[reader] job=%s step=extract_meta event=llm_call", jobShort)
+	doc, err := p.extractMetadataFromLLM(ctx, page, traceDir, jobShort)
+	if err != nil {
+		log.Printf("[reader] job=%s step=extract_meta event=llm_error err=%v", jobShort, err)
+		return nil, false, err
+	}
+
+	// 保底一些重要字段（使用类型安全的 toString）
+	if doc.Title == "" {
+		if title, ok := toString(page.Metadata["title"]); ok {
+			doc.Title = title
+		}
+	}
+	if doc.Author == "" {
+		if author, ok := toString(page.Metadata["author"]); ok {
+			doc.Author = author
+		}
+	}
+	if doc.PublishedDate == "" {
+		if pubDate, ok := toString(page.Metadata["published_date"]); ok {
+			doc.PublishedDate = pubDate
+		}
+	}
+
+	// 修复 imageURL
+
+	// Try to extract image from HTML if not in metadata
+	if doc.ImageURL == "" && page.HTML != "" {
+		if u := firstMetaImageURL(page.HTML); u != "" {
+			if resolved := resolveURL(page.URL, u); resolved != "" {
+				doc.ImageURL = resolved
+			} else {
+				doc.ImageURL = u
+			}
+		}
+	}
+	if doc.ImageURL == "" && page.HTML != "" {
+		if u := firstImageURL(page.HTML); u != "" {
+			if resolved := resolveURL(page.URL, u); resolved != "" {
+				doc.ImageURL = resolved
+			} else {
+				doc.ImageURL = u
+			}
+		}
+	}
+
+	// 保存到缓存
+	if err := p.writeMetaCache(ctx, page.URL, doc); err != nil {
+		log.Printf("[reader] job=%s step=extract_meta event=cache_write_error err=%v", jobShort, err)
+	}
+
+	if b, _ := json.MarshalIndent(doc, "", "  "); len(b) > 0 {
+		p.traceWrite(traceDir, "extracted.json", b)
+	}
+
+	return doc, false, nil
+}
+
+// extractMetadataFromLLM calls LLM to extract metadata and return a ReadwiseDocument
+func (p *Processor) extractMetadataFromLLM(ctx context.Context, page *mcpclient.Page, traceDir string, jobShort string) (*ReadwiseDocument, error) {
+	// MCP metadata incomplete, consider using LLM (if configured)
+	if p.cfg.LLMBaseURL == "" || p.cfg.LLMAPIKey == "" || p.cfg.LLMModel == "" {
+		return nil, errors.New("LLM not configured")
+	}
+
 	// Truncate excessively long HTML to reduce token usage
 	const maxChars = 200_000
-	if len(html) > maxChars {
-		// html = html[:maxChars]
-		log.Printf("html toooooo long, %d", len(html))
+	if len(page.HTML) > maxChars {
+		log.Printf("[reader] job=%s step=extract_meta event=html_too_long chars=%d max=%d", jobShort, len(page.HTML), maxChars)
+		return nil, fmt.Errorf("html too long, %d chars", len(page.HTML))
 	}
 
 	systemPrompt := "你是一名严谨的网页内容解析器。只输出一个合法 JSON 对象，不要输出任何多余字符，也不要使用 Markdown 代码块。严禁在 JSON 中包含原始 HTML 或 Markdown 内容（不要返回 html 字段）。JSON 必须严格符合 Readwise Reader 保存接口所需的字段与类型。"
-	userPrompt := buildExtractionPrompt(url, html)
-	p.traceWrite(traceDir, "extract_prompt_system.txt", []byte(systemPrompt))
-	p.traceWrite(traceDir, "extract_prompt_user.txt", []byte(userPrompt))
-
-	// Try body cache first
-	if cached, ok := p.tryReadMetaCache(ctx, url); ok {
-		if b, _ := json.MarshalIndent(cached, "", "  "); len(b) > 0 {
-			p.traceWrite(traceDir, "extracted_cached.json", b)
-		}
-		return cached, true, nil
-	}
+	userPrompt := buildExtractionPrompt(page)
+	p.traceWrite(traceDir, "llm_prompt_system.txt", []byte(systemPrompt))
+	p.traceWrite(traceDir, "llm_prompt_user.txt", []byte(userPrompt))
 
 	// OpenAI official Go SDK
 	opts := []option.RequestOption{option.WithAPIKey(p.cfg.LLMAPIKey)}
@@ -193,19 +286,16 @@ func (p *Processor) extractMetadata(ctx context.Context, html, url, traceDir str
 			openai.UserMessage(userPrompt),
 		},
 	}
-	// Some providers/models (e.g. certain Azure model groups) only support default temperature.
-	// Only set Temperature if configured via env to avoid 400s like
-	// "Unsupported value: 'temperature' does not support 0.2 with this model".
 	if p.cfg.LLMTemperature != nil {
 		params.Temperature = openai.Float(*p.cfg.LLMTemperature)
 	}
 
 	resp, err := client.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return nil, false, fmt.Errorf("llm request: %w", err)
+		return nil, fmt.Errorf("llm request: %w", err)
 	}
 	if len(resp.Choices) == 0 {
-		return nil, false, errors.New("llm no choices")
+		return nil, errors.New("llm no choices")
 	}
 	txt := strings.TrimSpace(resp.Choices[0].Message.Content)
 	// strip code fences if present
@@ -215,23 +305,19 @@ func (p *Processor) extractMetadata(ctx context.Context, html, url, traceDir str
 	txt = strings.TrimSpace(txt)
 	p.traceWrite(traceDir, "llm_raw_response.txt", []byte(txt))
 
-	var meta map[string]any
-	if err := json.Unmarshal([]byte(txt), &meta); err != nil {
-		return nil, false, fmt.Errorf("llm json parse: %w", err)
+	// Directly unmarshal to ReadwiseDocument since LLM is instructed to return matching structure
+	var doc ReadwiseDocument
+	if err := json.Unmarshal([]byte(txt), &doc); err != nil {
+		return nil, fmt.Errorf("llm json parse: %w", err)
 	}
-	if b, _ := json.MarshalIndent(meta, "", "  "); len(b) > 0 {
-		p.traceWrite(traceDir, "extracted.json", b)
+	if b, _ := json.MarshalIndent(doc, "", "  "); len(b) > 0 {
+		p.traceWrite(traceDir, "llm_extracted.json", b)
 	}
-	// Build body and cache it
-	body := buildReadwiseBody(meta)
-	if b, _ := json.MarshalIndent(body, "", "  "); len(b) > 0 {
-		p.traceWrite(traceDir, "extracted_body.json", b)
-	}
-	_ = p.writeMetaCache(ctx, url, body)
-	return body, false, nil
+
+	return &doc, nil
 }
 
-func buildExtractionPrompt(url, html string) string {
+func buildExtractionPrompt(page *mcpclient.Page) string {
 	// Use China Standard Time (+08:00) for temporal reasoning
 	cst := time.FixedZone("CST", 8*3600)
 	fetchTime := time.Now().In(cst).Format(time.RFC3339)
@@ -250,9 +336,13 @@ func buildExtractionPrompt(url, html string) string {
 
 	sb.WriteString("【输入】\n")
 	sb.WriteString("- 页面URL：")
-	sb.WriteString(url)
+	sb.WriteString(page.URL)
+	sb.WriteString("\n- 元信息Metadata：\n")
+	if b, _ := json.MarshalIndent(page.Metadata, "", "  "); len(b) > 0 {
+		sb.WriteString(string(b))
+	}
 	sb.WriteString("\n- HTML内容：\n")
-	sb.WriteString(html)
+	sb.WriteString(page.HTML)
 	sb.WriteString("\n\n")
 
 	sb.WriteString("【输出JSON字段定义】\n")
@@ -305,99 +395,14 @@ func buildExtractionPrompt(url, html string) string {
 	return sb.String()
 }
 
-func (p *Processor) saveToReadwise(ctx context.Context, meta map[string]any, originalHTML string, traceDir string) (string, error) {
+func (p *Processor) saveToReadwise(ctx context.Context, doc *ReadwiseDocument, traceDir string) (string, error) {
 	token := p.cfg.ReadwiseToken
 	if token == "" {
 		return "", errors.New("missing READWISE_API_TOKEN")
 	}
-	// strictly type and sanitize per Reader API
-	body := make(map[string]any)
-	if s, ok := toString(meta["url"]); ok {
-		body["url"] = s
-	}
-	// Include original fetched HTML only if it looks like HTML (avoid forwarding JSON envelopes)
-	if hs := strings.TrimSpace(originalHTML); hs != "" && looksLikeHTML(hs) {
-		body["html"] = hs
-	}
-	body["should_clean_html"] = toBool(meta["should_clean_html"], true)
-	if s, ok := toString(meta["title"]); ok {
-		body["title"] = s
-	}
-	if s, ok := toString(meta["author"]); ok {
-		body["author"] = s
-	}
-	if s, ok := toString(meta["published_date"]); ok {
-		if iso, ok2 := normalizePublishedDateChina(s); ok2 {
-			body["published_date"] = iso
-		}
-	}
-	if s, ok := toString(meta["image_url"]); ok {
-		body["image_url"] = s
-	}
-	if s, ok := toString(meta["summary"]); ok {
-		body["summary"] = s
-	}
-	if s, ok := toString(meta["category"]); ok {
-		body["category"] = s
-	}
-	if tags := toStringSlice(meta["tags"]); len(tags) > 0 {
-		body["tags"] = tags
-	}
-	if s, ok := toNotesString(meta["notes"]); ok {
-		body["notes"] = s
-	}
-	if s, ok := toString(meta["location"]); ok {
-		switch strings.ToLower(s) {
-		case "new", "later", "archive", "feed":
-			body["location"] = strings.ToLower(s)
-		}
-	}
-	if s, ok := toString(meta["saved_using"]); ok {
-		body["saved_using"] = s
-	}
-	// defaults
-	if _, ok := body["location"]; !ok {
-		body["location"] = "new"
-	}
-	if _, ok := body["category"]; !ok {
-		body["category"] = "article"
-	}
-	if _, ok := body["saved_using"]; !ok {
-		body["saved_using"] = "web_extractor"
-	}
 
-	// Ensure/derive image_url
-	baseURL, _ := toString(meta["url"])
-	if v, ok := body["image_url"]; ok {
-		s := toStringMust(v)
-		if s != "" && !isLikelyHTTPURL(s) {
-			if ru := resolveURL(baseURL, s); ru != "" {
-				body["image_url"] = ru
-			}
-		}
-	}
-	// Try meta og:image/twitter:image from original HTML
-	if _, ok := body["image_url"]; !ok || toStringMust(body["image_url"]) == "" {
-		if u := firstMetaImageURL(originalHTML); u != "" {
-			if ru := resolveURL(baseURL, u); ru != "" {
-				body["image_url"] = ru
-			} else {
-				body["image_url"] = u
-			}
-		}
-	}
-	// Fallback: if still missing, pick first image from original HTML
-	if _, ok := body["image_url"]; !ok || toStringMust(body["image_url"]) == "" {
-		if u := firstImageURL(originalHTML); u != "" {
-			if ru := resolveURL(baseURL, u); ru != "" {
-				body["image_url"] = ru
-			} else {
-				body["image_url"] = u
-			}
-		}
-	}
-
-	b, _ := json.Marshal(body)
+	// Marshal the document to JSON
+	b, _ := json.Marshal(doc)
 	p.traceWrite(traceDir, "readwise_request.json", b)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://readwise.io/api/v3/save/", bytes.NewReader(b))
 	req.Header.Set("Authorization", "Token "+token)
@@ -426,15 +431,6 @@ func (p *Processor) saveToReadwise(ctx context.Context, meta map[string]any, ori
 	// Fallback: construct from id if url missing
 	if link == "" && id != "" {
 		link = "https://read.readwise.io/read/" + id
-	}
-	if link != "" {
-		if id != "" {
-			log.Printf("[reader] readwise saved OK id=%s url=%s", id, link)
-		} else {
-			log.Printf("[reader] readwise saved OK url=%s", link)
-		}
-	} else {
-		log.Printf("[reader] readwise saved OK (no url in response)")
 	}
 	return link, nil
 }
@@ -487,114 +483,114 @@ func toString(v any) (string, bool) {
 	}
 }
 
-// toStringMust converts to string using toString, returns empty on failure.
-func toStringMust(v any) string {
-	if s, ok := toString(v); ok {
-		return s
-	}
-	return ""
-}
+// // toStringMust converts to string using toString, returns empty on failure.
+// func toStringMust(v any) string {
+// 	if s, ok := toString(v); ok {
+// 		return s
+// 	}
+// 	return ""
+// }
 
-func toBool(v any, def bool) bool {
-	switch t := v.(type) {
-	case bool:
-		return t
-	case string:
-		s := strings.ToLower(strings.TrimSpace(t))
-		if s == "true" || s == "1" || s == "yes" {
-			return true
-		}
-		if s == "false" || s == "0" || s == "no" {
-			return false
-		}
-	case float64:
-		return t != 0
-	case int, int64:
-		return fmt.Sprintf("%v", v) != "0"
-	}
-	return def
-}
+// func toBool(v any, def bool) bool {
+// 	switch t := v.(type) {
+// 	case bool:
+// 		return t
+// 	case string:
+// 		s := strings.ToLower(strings.TrimSpace(t))
+// 		if s == "true" || s == "1" || s == "yes" {
+// 			return true
+// 		}
+// 		if s == "false" || s == "0" || s == "no" {
+// 			return false
+// 		}
+// 	case float64:
+// 		return t != 0
+// 	case int, int64:
+// 		return fmt.Sprintf("%v", v) != "0"
+// 	}
+// 	return def
+// }
 
-func toStringSlice(v any) []string {
-	switch t := v.(type) {
-	case []string:
-		return filterNotEmpty(t)
-	case []any:
-		out := make([]string, 0, len(t))
-		for _, it := range t {
-			if s, ok := toString(it); ok {
-				out = append(out, s)
-			}
-		}
-		return filterNotEmpty(out)
-	case string:
-		// allow comma-separated
-		parts := strings.Split(t, ",")
-		for i := range parts {
-			parts[i] = strings.TrimSpace(parts[i])
-		}
-		return filterNotEmpty(parts)
-	default:
-		return nil
-	}
-}
+// func toStringSlice(v any) []string {
+// 	switch t := v.(type) {
+// 	case []string:
+// 		return filterNotEmpty(t)
+// 	case []any:
+// 		out := make([]string, 0, len(t))
+// 		for _, it := range t {
+// 			if s, ok := toString(it); ok {
+// 				out = append(out, s)
+// 			}
+// 		}
+// 		return filterNotEmpty(out)
+// 	case string:
+// 		// allow comma-separated
+// 		parts := strings.Split(t, ",")
+// 		for i := range parts {
+// 			parts[i] = strings.TrimSpace(parts[i])
+// 		}
+// 		return filterNotEmpty(parts)
+// 	default:
+// 		return nil
+// 	}
+// }
 
-func toNotesString(v any) (string, bool) {
-	if s, ok := toString(v); ok {
-		return s, true
-	}
-	switch t := v.(type) {
-	case []any:
-		parts := make([]string, 0, len(t))
-		for _, it := range t {
-			if s, ok := toString(it); ok {
-				parts = append(parts, s)
-			}
-		}
-		s := strings.TrimSpace(strings.Join(parts, "\n"))
-		if s == "" {
-			return "", false
-		}
-		return s, true
-	case map[string]any:
-		b, _ := json.Marshal(t)
-		s := strings.TrimSpace(string(b))
-		if s == "" {
-			return "", false
-		}
-		return s, true
-	}
-	return "", false
-}
+// func toNotesString(v any) (string, bool) {
+// 	if s, ok := toString(v); ok {
+// 		return s, true
+// 	}
+// 	switch t := v.(type) {
+// 	case []any:
+// 		parts := make([]string, 0, len(t))
+// 		for _, it := range t {
+// 			if s, ok := toString(it); ok {
+// 				parts = append(parts, s)
+// 			}
+// 		}
+// 		s := strings.TrimSpace(strings.Join(parts, "\n"))
+// 		if s == "" {
+// 			return "", false
+// 		}
+// 		return s, true
+// 	case map[string]any:
+// 		b, _ := json.Marshal(t)
+// 		s := strings.TrimSpace(string(b))
+// 		if s == "" {
+// 			return "", false
+// 		}
+// 		return s, true
+// 	}
+// 	return "", false
+// }
 
-func filterNotEmpty(in []string) []string {
-	out := in[:0]
-	for _, s := range in {
-		if strings.TrimSpace(s) != "" {
-			out = append(out, s)
-		}
-	}
-	return out
-}
+// func filterNotEmpty(in []string) []string {
+// 	out := in[:0]
+// 	for _, s := range in {
+// 		if strings.TrimSpace(s) != "" {
+// 			out = append(out, s)
+// 		}
+// 	}
+// 	return out
+// }
 
-// looksLikeHTML makes a light-weight guess whether the string is HTML markup.
-func looksLikeHTML(s string) bool {
-	if s == "" {
-		return false
-	}
-	t := strings.ToLower(strings.TrimSpace(s))
-	if strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[") {
-		return false
-	}
-	if strings.HasPrefix(t, "<!doctype") || strings.HasPrefix(t, "<html") || strings.HasPrefix(t, "<head") || strings.HasPrefix(t, "<body") {
-		return true
-	}
-	// Heuristic: contains common block-level tags
-	if strings.Contains(t, "<p") || strings.Contains(t, "</p>") || strings.Contains(t, "<div") || strings.Contains(t, "</div>") || strings.Contains(t, "<article") {
-		return true
-	}
-	return false
-}
+// // looksLikeHTML makes a light-weight guess whether the string is HTML markup.
+// func looksLikeHTML(s string) bool {
+// 	if s == "" {
+// 		return false
+// 	}
+// 	t := strings.ToLower(strings.TrimSpace(s))
+// 	if strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[") {
+// 		return false
+// 	}
+// 	if strings.HasPrefix(t, "<!doctype") || strings.HasPrefix(t, "<html") || strings.HasPrefix(t, "<head") || strings.HasPrefix(t, "<body") {
+// 		return true
+// 	}
+// 	// Heuristic: contains common block-level tags
+// 	if strings.Contains(t, "<p") || strings.Contains(t, "</p>") || strings.Contains(t, "<div") || strings.Contains(t, "</div>") || strings.Contains(t, "<article") {
+// 		return true
+// 	}
+// 	return false
+// }
 
 // isLikelyHTTPURL returns true if s starts with http:// or https://
 func isLikelyHTTPURL(s string) bool {
@@ -884,43 +880,78 @@ func parseUnixTimestamp(s string) (time.Time, bool) {
 	}
 }
 
-// tryReadCache returns cached HTML if found.
-func (p *Processor) tryReadCache(ctx context.Context, url string) (string, bool) {
+// tryReadPageCache returns cached Page (HTML + metadata) if found.
+func (p *Processor) tryReadPageCache(ctx context.Context, url string) (*mcpclient.Page, bool) {
 	// Prefer Redis if configured
 	if p.rc != nil {
-		key := p.rc.Key("html", hashURL(url))
-		if v, ok, err := p.rc.GetString(ctx, key); err == nil && ok {
-			return v, true
+		key := p.rc.Key("page", hashURL(url))
+		if jsonStr, ok, err := p.rc.GetString(ctx, key); err == nil && ok && jsonStr != "" {
+			var page mcpclient.Page
+			if err := json.Unmarshal([]byte(jsonStr), &page); err == nil {
+				return &page, true
+			}
 		}
 		// Redis enabled: do not fallback to local file cache
-		return "", false
+		return nil, false
 	}
 	// Fallback to file cache (if enabled)
-	path := p.cacheFilePath(url)
+	path := p.cachePageFilePath(url)
 	if path == "" {
-		return "", false
+		return nil, false
 	}
 	b, err := os.ReadFile(path)
 	if err != nil || len(b) == 0 {
-		return "", false
+		return nil, false
 	}
-	return string(b), true
+	var page mcpclient.Page
+	if err := json.Unmarshal(b, &page); err != nil {
+		return nil, false
+	}
+	return &page, true
 }
 
-// writeCache saves HTML to cache file (best-effort).
-func (p *Processor) writeCache(ctx context.Context, url, html string) error {
+// // tryReadCache returns cached HTML if found (legacy, for backwards compatibility).
+// func (p *Processor) tryReadCache(ctx context.Context, url string) (string, bool) {
+// 	// Prefer Redis if configured
+// 	if p.rc != nil {
+// 		key := p.rc.Key("html", hashURL(url))
+// 		if v, ok, err := p.rc.GetString(ctx, key); err == nil && ok {
+// 			return v, true
+// 		}
+// 		// Redis enabled: do not fallback to local file cache
+// 		return "", false
+// 	}
+// 	// Fallback to file cache (if enabled)
+// 	path := p.cacheFilePath(url)
+// 	if path == "" {
+// 		return "", false
+// 	}
+// 	b, err := os.ReadFile(path)
+// 	if err != nil || len(b) == 0 {
+// 		return "", false
+// 	}
+// 	return string(b), true
+// }
+
+// writePageCache saves complete Page (HTML + metadata) to cache (best-effort).
+func (p *Processor) writePageCache(ctx context.Context, url string, page *mcpclient.Page) error {
+	// Marshal Page to JSON
+	jsonBytes, err := json.Marshal(page)
+	if err != nil {
+		return fmt.Errorf("marshal page: %w", err)
+	}
+
 	// When Redis is configured, use Redis only and do not write local files
 	if p.rc != nil {
-		key := p.rc.Key("html", hashURL(url))
-		if err := p.rc.SetString(ctx, key, html); err != nil {
-			log.Printf("[reader] redis set html error: %v", err)
-		} else {
-			log.Printf("[reader] redis set html ok key=%s bytes=%d ttl=%ds", key, len(html), p.cfg.RedisTTLSeconds)
+		key := p.rc.Key("page", hashURL(url))
+		if err := p.rc.SetString(ctx, key, string(jsonBytes)); err != nil {
+			return err
 		}
 		return nil
 	}
+
 	// Local file cache (when Redis not in use)
-	path := p.cacheFilePath(url)
+	path := p.cachePageFilePath(url)
 	if path == "" {
 		return nil
 	}
@@ -928,10 +959,46 @@ func (p *Processor) writeCache(ctx context.Context, url, html string) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(html), 0o644); err != nil {
+	if err := os.WriteFile(tmp, jsonBytes, 0o644); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// writeCache saves HTML to cache file (best-effort, legacy).
+// func (p *Processor) writeCache(ctx context.Context, url, html string) error {
+// 	// When Redis is configured, use Redis only and do not write local files
+// 	if p.rc != nil {
+// 		key := p.rc.Key("html", hashURL(url))
+// 		if err := p.rc.SetString(ctx, key, html); err != nil {
+// 			log.Printf("[reader] redis set html error: %v", err)
+// 		} else {
+// 			log.Printf("[reader] redis set html ok key=%s bytes=%d ttl=%ds", key, len(html), p.cfg.RedisTTLSeconds)
+// 		}
+// 		return nil
+// 	}
+// 	// Local file cache (when Redis not in use)
+// 	path := p.cacheFilePath(url)
+// 	if path == "" {
+// 		return nil
+// 	}
+// 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+// 		return err
+// 	}
+// 	tmp := path + ".tmp"
+// 	if err := os.WriteFile(tmp, []byte(html), 0o644); err != nil {
+// 		return err
+// 	}
+// 	return os.Rename(tmp, path)
+// }
+
+func (p *Processor) cachePageFilePath(url string) string {
+	dir := strings.TrimSpace(p.cfg.ReaderCacheDir)
+	if dir == "" {
+		return ""
+	}
+	h := hashURL(url)
+	return filepath.Join(dir, h+".page.json")
 }
 
 func (p *Processor) cacheFilePath(url string) string {
@@ -966,12 +1033,12 @@ func sha256Sum(b []byte) string {
 }
 
 // tryReadMetaCache loads a previously computed Readwise body JSON if present
-func (p *Processor) tryReadMetaCache(ctx context.Context, url string) (map[string]any, bool) {
+func (p *Processor) tryReadMetaCache(ctx context.Context, url string) (*ReadwiseDocument, bool) {
 	// Prefer Redis if configured
 	if p.rc != nil {
 		key := p.rc.Key("body", hashURL(url))
 		if s, ok, err := p.rc.GetString(ctx, key); err == nil && ok && s != "" {
-			var v map[string]any
+			var v *ReadwiseDocument
 			if json.Unmarshal([]byte(s), &v) == nil {
 				return v, true
 			}
@@ -979,100 +1046,175 @@ func (p *Processor) tryReadMetaCache(ctx context.Context, url string) (map[strin
 		// Redis enabled: do not fallback to local file cache
 		return nil, false
 	}
-	// Fallback to file
-	path := p.cacheMetaFilePath(url)
-	if path == "" {
-		return nil, false
-	}
-	b, err := os.ReadFile(path)
-	if err != nil || len(b) == 0 {
-		return nil, false
-	}
-	var v map[string]any
-	if err := json.Unmarshal(b, &v); err != nil {
-		return nil, false
-	}
-	return v, true
+
+	return nil, false
 }
 
-func (p *Processor) writeMetaCache(ctx context.Context, url string, body map[string]any) error {
-	// Marshal once for Redis and/or file
-	b, _ := json.MarshalIndent(body, "", "  ")
-	if p.rc != nil {
-		key := p.rc.Key("body", hashURL(url))
-		if err := p.rc.SetString(ctx, key, string(b)); err != nil {
-			log.Printf("[reader] redis set body error: %v", err)
-		} else {
-			log.Printf("[reader] redis set body ok key=%s bytes=%d ttl=%ds", key, len(b), p.cfg.RedisTTLSeconds)
-		}
-		// Do not write local files when Redis is enabled
+// writeMetaCache saves a ReadwiseDocument to cache
+func (p *Processor) writeMetaCache(ctx context.Context, url string, doc *ReadwiseDocument) error {
+	if p.rc == nil {
 		return nil
 	}
-	// File (when Redis not in use)
-	path := p.cacheMetaFilePath(url)
-	if path == "" {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	doc.HTML = ""
+	b, _ := json.Marshal(doc)
+	key := p.rc.Key("body", hashURL(url))
+	return p.rc.SetString(ctx, key, string(b))
 }
 
-// buildReadwiseBody converts extracted meta into a strictly-typed Reader API body
-func buildReadwiseBody(meta map[string]any) map[string]any {
-	body := make(map[string]any)
-	if s, ok := toString(meta["url"]); ok {
-		body["url"] = s
-	}
-	body["should_clean_html"] = toBool(meta["should_clean_html"], true)
-	if s, ok := toString(meta["title"]); ok {
-		body["title"] = s
-	}
-	if s, ok := toString(meta["author"]); ok {
-		body["author"] = s
-	}
-	if s, ok := toString(meta["published_date"]); ok {
-		if iso, ok2 := normalizePublishedDateChina(s); ok2 {
-			body["published_date"] = iso
-		}
-	}
-	if s, ok := toString(meta["image_url"]); ok {
-		body["image_url"] = s
-	}
-	if s, ok := toString(meta["summary"]); ok {
-		body["summary"] = s
-	}
-	if s, ok := toString(meta["category"]); ok {
-		body["category"] = s
-	}
-	if tags := toStringSlice(meta["tags"]); len(tags) > 0 {
-		body["tags"] = tags
-	}
-	if s, ok := toNotesString(meta["notes"]); ok {
-		body["notes"] = s
-	}
-	if s, ok := toString(meta["location"]); ok {
-		switch strings.ToLower(s) {
-		case "new", "later", "archive", "feed":
-			body["location"] = strings.ToLower(s)
-		}
-	}
-	if s, ok := toString(meta["saved_using"]); ok {
-		body["saved_using"] = s
-	}
-	if _, ok := body["location"]; !ok {
-		body["location"] = "new"
-	}
-	if _, ok := body["saved_using"]; !ok {
-		body["saved_using"] = "web_extractor"
-	}
-	if _, ok := body["category"]; !ok {
-		body["category"] = "article"
-	}
-	return body
-}
+// // buildReadwiseDocument constructs a ReadwiseDocument from a Page and metadata.
+// // It merges MCP metadata with optional HTML content and sets sensible defaults.
+// func buildReadwiseDocument(page *mcpclient.Page, pageURL string, originalHTML string) *ReadwiseDocument {
+// 	meta := page.Metadata
+// 	if meta == nil {
+// 		meta = make(map[string]any)
+// 	}
+
+// 	doc := &ReadwiseDocument{
+// 		URL:             pageURL,
+// 		ShouldCleanHTML: true, // Default: let Readwise clean the HTML
+// 		Location:        "new",
+// 		SavedUsing:      "wecom-robot-mcp",
+// 		Category:        "article",
+// 	}
+
+// 	// Use original HTML if provided (from MCP fetch)
+// 	if originalHTML != "" && looksLikeHTML(originalHTML) {
+// 		doc.HTML = originalHTML
+// 	}
+
+// 	// Extract fields from metadata
+// 	if s, ok := toString(meta["title"]); ok {
+// 		doc.Title = s
+// 	}
+// 	if s, ok := toString(meta["author"]); ok {
+// 		doc.Author = s
+// 	}
+// 	if s, ok := toString(meta["published_date"]); ok {
+// 		if iso, ok2 := normalizePublishedDateChina(s); ok2 {
+// 			doc.PublishedDate = iso
+// 		}
+// 	}
+
+// 	// Image URL: resolve relative URLs to absolute
+// 	if s, ok := toString(meta["image_url"]); ok {
+// 		if isLikelyHTTPURL(s) {
+// 			doc.ImageURL = s
+// 		} else {
+// 			if resolved := resolveURL(pageURL, s); resolved != "" {
+// 				doc.ImageURL = resolved
+// 			}
+// 		}
+// 	}
+
+// 	// Try to extract image from HTML if not in metadata
+// 	if doc.ImageURL == "" && originalHTML != "" {
+// 		if u := firstMetaImageURL(originalHTML); u != "" {
+// 			if resolved := resolveURL(pageURL, u); resolved != "" {
+// 				doc.ImageURL = resolved
+// 			} else {
+// 				doc.ImageURL = u
+// 			}
+// 		}
+// 	}
+// 	if doc.ImageURL == "" && originalHTML != "" {
+// 		if u := firstImageURL(originalHTML); u != "" {
+// 			if resolved := resolveURL(pageURL, u); resolved != "" {
+// 				doc.ImageURL = resolved
+// 			} else {
+// 				doc.ImageURL = u
+// 			}
+// 		}
+// 	}
+
+// 	if s, ok := toString(meta["summary"]); ok {
+// 		doc.Summary = s
+// 	}
+
+// 	if s, ok := toString(meta["category"]); ok {
+// 		switch strings.ToLower(s) {
+// 		case "article", "email", "rss", "highlight", "note", "pdf", "epub", "tweet", "video":
+// 			doc.Category = strings.ToLower(s)
+// 		}
+// 	}
+
+// 	if tags := toStringSlice(meta["tags"]); len(tags) > 0 {
+// 		doc.Tags = tags
+// 	}
+
+// 	if s, ok := toNotesString(meta["notes"]); ok {
+// 		doc.Notes = s
+// 	}
+
+// 	if s, ok := toString(meta["location"]); ok {
+// 		switch strings.ToLower(s) {
+// 		case "new", "later", "archive", "feed":
+// 			doc.Location = strings.ToLower(s)
+// 		}
+// 	}
+
+// 	if s, ok := toString(meta["saved_using"]); ok {
+// 		doc.SavedUsing = s
+// 	} else if s, ok := toString(meta["savedUsing"]); ok {
+// 		doc.SavedUsing = s
+// 	}
+
+// 	if v, ok := meta["should_clean_html"]; ok {
+// 		doc.ShouldCleanHTML = toBool(v, true)
+// 	}
+
+// 	return doc
+// }
+
+// // buildReadwiseBody converts extracted meta into a strictly-typed Reader API body (legacy)
+// func buildReadwiseBody(meta map[string]any) map[string]any {
+// 	body := make(map[string]any)
+// 	if s, ok := toString(meta["url"]); ok {
+// 		body["url"] = s
+// 	}
+// 	body["should_clean_html"] = toBool(meta["should_clean_html"], true)
+// 	if s, ok := toString(meta["title"]); ok {
+// 		body["title"] = s
+// 	}
+// 	if s, ok := toString(meta["author"]); ok {
+// 		body["author"] = s
+// 	}
+// 	if s, ok := toString(meta["published_date"]); ok {
+// 		if iso, ok2 := normalizePublishedDateChina(s); ok2 {
+// 			body["published_date"] = iso
+// 		}
+// 	}
+// 	if s, ok := toString(meta["image_url"]); ok {
+// 		body["image_url"] = s
+// 	}
+// 	if s, ok := toString(meta["summary"]); ok {
+// 		body["summary"] = s
+// 	}
+// 	if s, ok := toString(meta["category"]); ok {
+// 		body["category"] = s
+// 	}
+// 	if tags := toStringSlice(meta["tags"]); len(tags) > 0 {
+// 		body["tags"] = tags
+// 	}
+// 	if s, ok := toNotesString(meta["notes"]); ok {
+// 		body["notes"] = s
+// 	}
+// 	if s, ok := toString(meta["location"]); ok {
+// 		switch strings.ToLower(s) {
+// 		case "new", "later", "archive", "feed":
+// 			body["location"] = strings.ToLower(s)
+// 		}
+// 	}
+// 	if s, ok := toString(meta["saved_using"]); ok {
+// 		body["saved_using"] = s
+// 	}
+// 	if _, ok := body["location"]; !ok {
+// 		body["location"] = "new"
+// 	}
+// 	if _, ok := body["saved_using"]; !ok {
+// 		body["saved_using"] = "web_extractor"
+// 	}
+// 	if _, ok := body["category"]; !ok {
+// 		body["category"] = "article"
+// 	}
+// 	return body
+// }
