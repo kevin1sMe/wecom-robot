@@ -1,177 +1,81 @@
-# WeCom（企业微信）回调服务（Go）
+# 公众号文章采集到Readwise Reader
 
-最小可用的 HTTP 服务：接收企业微信加密回调、验签、解密、打印原始 XML，并按标准回包：
-- 非事件消息：被动加密回复文本“OK”（Encrypt/MsgSignature/TimeStamp/Nonce）。
-- 事件消息：返回明文 `success`（不回消息）。
+## Overview
+该项目实现了企业微信回调服务：完成 URL 验证、消息验签解密，并按照协议进行被动回复。当收到的文本消息以 `http://` 或 `https://` 开头时，服务会在后台触发“抓取 → 提取 → 保存”的流水线，从外部 MCP streamable HTTP 服务获取网页内容，调用 OpenAI 兼容模型提取元信息，最终保存到 Readwise Reader。
 
-## 目录结构
+其它网页的内容，也可以采集到Readwise Reader。
 
-```
-.
-├── cmd/
-│   └── wecom-robot/
-│       └── main.go          # 程序入口
-├── internal/
-│   ├── config/
-│   │   └── config.go        # 环境变量加载
-│   ├── server/
-│   │   └── handlers.go      # HTTP 路由与处理
-│   └── wecom/
-│       └── wxbizmsgcrypt.go # 官方加解密实现（已内置）
-├── go.mod
-└── README.md
-```
+## Features
+- 使用企业微信官方 `wxbizmsgcrypt` 代码处理 URL 验证、消息验签和 AES-256-CBC 解密。
+- `POST /` 会根据消息类型自动回包：事件消息返回明文 `success`，文本消息加密回复 `OK`。
+- 文本消息携带 URL 时异步执行流水线，不阻塞企业微信回调，避免重复重试。
+- 通过 MCP HTTP 工具（默认 `scrape_wechat_article`）统一抓取网页，支持 Bearer 鉴权。
+- 采集到的 HTML 交由 LLM（OpenAI 兼容接口）提取结构化 JSON，再写入 Readwise Reader。
+- 提供文件系统或 Redis 缓存，加速重复抓取；可选追踪目录记录流水线每一步的上下文。
+- `POST /url` 表单接口用于本地测试同样的流水线，无需企业微信环境。
 
-## 配置
-
-设置以下环境变量：
-
-- `WECOM_TOKEN`：在企业微信后台配置的 Token。
-- `WECOM_ENCODING_AES_KEY`：43 位 EncodingAESKey。
-- `WECOM_RECEIVE_ID`：接收方标识。企业自建应用为企业 ID（CorpID，ww 开头）；第三方套件为 SuiteID。
-- `PORT`（可选）：默认 `8080`。
-
-## 运行
-
+## Quick Start
 ```sh
+# 必需：企业微信回调配置
 export WECOM_TOKEN=your_token
 export WECOM_ENCODING_AES_KEY=your_43_char_key
 export WECOM_RECEIVE_ID=your_corp_id_or_suite_id
 
-# 使用本地缓存目录（适配沙箱写权限）
-GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
-```
-
-服务默认监听 `:8080`（或 `:$PORT`）。
-
-## Docker
-
-本仓库提供 Docker 镜像构建：
-
-- 本地构建（生成 `wecom-robot:local`）：
-
-  ```sh
-  ./build/local-build.sh
-  docker run --rm -p 8080:8080 \
-    -e WECOM_TOKEN=your_token \
-    -e WECOM_ENCODING_AES_KEY=your_43_char_key \
-    -e WECOM_RECEIVE_ID=your_corp_id_or_suite_id \
-    wecom-robot:local
-  ```
-
-- GitHub Actions 会在 push/pr 触发，构建并推送镜像到腾讯云 TCR（需在环境 secrets 配置 `TCR_REGISTRY`、`TCR_NAMESPACE`、`TCR_REPOSITORY`、`TCR_USERNAME`、`TCR_PASSWORD`）。
-
-## 回调 URL 配置与接口
-
-企业微信后台“回调 URL”推荐配置为根路径：
-- 根路径：`https://<your-domain>/`（本项目仅支持根路径）
-
-同一个回调 URL 同时承担两种行为：
-- `GET` 验证 URL：企业微信会携带 `msg_signature`、`timestamp`、`nonce`、`echostr` 参数发起请求，服务端需要验签并解密 `echostr` 原样返回。
-- `POST` 接收消息：企业微信会携带 `msg_signature`、`timestamp`、`nonce` 参数，并在 Body 的 XML 里包含 `<Encrypt>` 字段。
-
-- `GET /`：URL 校验。参数 `msg_signature`、`timestamp`、`nonce`、`echostr`。
-  - 验签并解密 `echostr`，原样返回解密后的 echo 字符串。
-- `POST /`：消息接收。参数 `msg_signature`、`timestamp`、`nonce`；Body 为包含 `<Encrypt>` 的 XML。
-  - 验签并解密消息；日志打印解密后的原始 XML。
-  - 若为非事件消息：被动加密回复文本“OK”（标准回包 XML）。
-  - 若为事件消息：返回明文 `success`。
-
-示例 POST 结构：
-
-```xml
-<xml>
-  <ToUserName><![CDATA[wxCorpId]]></ToUserName>
-  <AgentID><![CDATA[1000002]]></AgentID>
-  <Encrypt><![CDATA[base64_ciphertext]]></Encrypt>
-</xml>
-```
-
-注意：`msg_signature`、`timestamp`、`nonce`、`echostr` 作为查询参数传递；Body 只需 `<Encrypt>` 字段即可。
-
-健康检查：`GET /` 无参数时返回 `ok`。
-
-被动回复说明：
-- 需要正确设置 `WECOM_RECEIVE_ID`（企业ID或SuiteID），否则无法进行加密回包（服务会兜底返回明文 `success`）。
-- 回包超时会导致企业微信重试，请确保处理耗时 < 5 秒。
-
-## 说明
-
-- 使用企业微信官方 Go 实现（`wxbizmsgcrypt.go`）进行验签、解密与回包加密。
-- 元数据提取使用官方 OpenAI Go SDK（`github.com/openai/openai-go`），支持自定义 `LLM_BASE_URL`。
-- 加密：AES-256-CBC + PKCS#7，IV 为 AESKey 的前 16 字节（`EncodingAESKey` 解出 32 字节）。
-- 签名：对 `[token, timestamp, nonce, encrypted]` 字典序排序后拼接，做 SHA1。
-- 明文结构：`16B 随机 | 4B 大端长度 | XML 消息 | receiveid`。服务会在提供 `WECOM_RECEIVE_ID` 时进行校验。
-
-## 链接到 Readwise（Go 内置集成）
-
-当接收到文本消息且内容包含 `http://` 或 `https://` 链接时，服务会在后台执行“抓取 → 提取 → 保存”流水线：
-
-- 抓取：通过 MCP `streamablehttp`（或兼容）服务器获取原始 HTML（不进行直接 HTTP 抓取）
-- 提取：调用 OpenAI 兼容 Chat Completions 模型，输出严格 JSON 的元数据
-- 保存：调用 Readwise Reader API `/api/v3/save/`
-
-主回包不受影响（事件：明文 `success`；文本：加密回复 `OK`），流水线异步执行，避免企业微信重试。
-
-必需/可选环境变量：
-- WeCom：`WECOM_TOKEN`、`WECOM_ENCODING_AES_KEY`、`WECOM_RECEIVE_ID`、`PORT`（可选）
-- LLM：`LLM_BASE_URL`（例如官方为 `https://api.openai.com/v1`）、`LLM_API_KEY`、`LLM_MODEL`（也兼容 `EXAMPLE_BASE_URL`、`EXAMPLE_API_KEY`、`EXAMPLE_MODEL_NAME`）
-- LLM 可选参数：`LLM_TEMPERATURE`（不设置则不传该参数，使用模型默认值；如某些 Azure 模型组仅支持默认温度，建议留空或设为 `1`）
-- Readwise：`READWISE_API_TOKEN`
-- MCP（必需）：
-  - `MCP_HTTP_URL`（你的 MCP HTTP 端点，例如 `http://localhost:8080/mcp`）
-  - `MCP_TOOL_NAME`（默认 `http`）
-- 缓存（可选）：
-  - `READER_CACHE_DIR`（抓取结果本地缓存目录，默认 `.reader-cache`）
-  - `REDIS_ADDR`（启用 Redis 缓存；形如 `127.0.0.1:6379` 或 `redis://:pass@host:6379/0`）
-  - `REDIS_PREFIX`（可选，键前缀，默认 `wecom-robot`）
-  - `REDIS_TTL_SECONDS`（可选，键过期时间，默认 `86400`=24 小时）
- - 追踪日志（可选）：
-   - `READER_LOG_DIR`（每次处理的上下文落盘目录，默认 `.reader-logs`）
-
-快速运行示例：
-
-```sh
-export WECOM_TOKEN=your_token
-export WECOM_ENCODING_AES_KEY=your_43_char_key
-export WECOM_RECEIVE_ID=your_corp_id_or_suite_id
-
-export LLM_BASE_URL=https://api.openai.com/v1  # 或你的 OpenAI 兼容端点
-export LLM_API_KEY=sk-xxx
+# 流水线依赖：MCP + LLM + Readwise（按需启用）
+export MCP_HTTP_URL=https://your-mcp-endpoint.example/mcp
+export MCP_TOOL_NAME=scrape_wechat_article   # 可选，默认已设
+export LLM_BASE_URL=https://api.openai.com/v1
+export LLM_API_KEY=sk-your_key
 export LLM_MODEL=gpt-4o-mini
-# 可选：如使用 Azure 某些模型组（如 azure/gpt-5-mini）且其仅支持默认温度，建议不设置该变量；
-# 若确需设置请用 1
-# export LLM_TEMPERATURE=1
-export READWISE_API_TOKEN=rw_XXX
+export READWISE_API_TOKEN=rw_your_token
 
-# MCP streamable HTTP（必需）
-export MCP_HTTP_URL=http://localhost:8080/mcp
-
+# 在受限环境建议自定义 Go 缓存目录
 GOCACHE=$(pwd)/.gocache go run ./cmd/wecom-robot
-
-### 本地测试入口（非 WeCom）
-
-- POST `./url` 表单：`url=https://example.com`
-- 行为：与企业微信文本消息中的链接处理一致，后台执行“抓取 → 提取 → 保存”，接口立即返回 `queued`
-- 缓存：若设置 `READER_CACHE_DIR`（默认 `.reader-cache`），会按 URL 的 SHA-256 计算文件名并缓存 HTML，例如：`.reader-cache/<hash>.html`。再次请求相同 URL 将命中缓存并跳过抓取。
-  - 若配置了 `REDIS_ADDR`，将仅使用 Redis 进行缓存与读取（键：`<prefix>:html:<sha256>` 和 `<prefix>:body:<sha256>`），不再读写本地文件缓存。
-- 追踪日志：若设置 `READER_LOG_DIR`（默认 `.reader-logs`），每次请求会在该目录下创建 `<hash>-<timestamp>/`，包含：
-  - `url.txt`、`fetch_source.txt`（cache/mcp）、`fetch.html`
-  - `extract_prompt_system.txt`、`extract_prompt_user.txt`、`llm_raw_response.txt`、`extracted.json`
-  - `readwise_request.json`、`readwise_response_<status>.txt`、遇错时 `error.txt`
-  - 调试日志（step-based）：控制台输出包含 `job=<id> step=<name> event=<start|end|error>` 字段，便于串联异步流程；可按 `job=<id>` 过滤（URL 的 SHA-256 前 8 位）。
-    - 示例：
-      - `[reader] job=ab12cd34 step=process event=start url=https://...`
-      - `[reader] job=ab12cd34 step=fetch_html event=start`
-      - `[reader] job=ab12cd34 step=fetch_html event=end from_cache=false bytes=123456 dur=1.23s`
-      - `[reader] job=ab12cd34 step=extract_meta event=end from_cache=false keys=10 bytes=2048 dur=2.01s`
-      - `[reader] job=ab12cd34 step=save_readwise event=end dur=350ms`
-      - `[reader] job=ab12cd34 step=process event=end url=https://... dur=3.85s`
-- 示例：
-
 ```
-curl -X POST http://localhost:8080/url \
-  -H 'Content-Type: application/x-www-form-urlencoded' \
-  -d 'url=https://mp.weixin.qq.com/s/R5t8xJW1CnjJjZoeOgX_Rg'
+服务默认监听 `:8080`，可通过设置 `PORT` 环境变量调整。
+
+## Configuration
+### 必需（WeCom 回调）
+- `WECOM_TOKEN` – 企业微信后台配置的 Token。
+- `WECOM_ENCODING_AES_KEY` – 43 位 EncodingAESKey。
+- `WECOM_RECEIVE_ID` – 企业 ID（CorpID，`ww` 开头）或第三方套件 SuiteID。
+- `PORT` – 可选，默认 `8080`。
+
+### 流水线依赖
+- `MCP_HTTP_URL` – MCP streamable HTTP 端点；流水线必须配置。
+- `MCP_TOOL_NAME` – MCP 工具名称，默认 `scrape_wechat_article`。
+- `MCP_AUTH_TOKEN` – 可选 Bearer Token。
+- `LLM_BASE_URL`、`LLM_API_KEY`、`LLM_MODEL` – OpenAI 兼容接口参数，可使用 `EXAMPLE_*` 变量兜底。
+- `LLM_TEMPERATURE` – 可选，解析为 `float64` 后传给模型；留空则使用默认温度。
+- `READWISE_API_TOKEN` – Readwise Reader API Key。
+
+### 缓存与调试
+- `READER_CACHE_DIR` – 本地 HTML 缓存目录，默认 `.reader-cache`（Redis 启用时自动禁用）。
+- `READER_LOG_DIR` – 每次任务的追踪目录，默认 `.reader-logs`。
+- `REDIS_ADDR` – 启用 Redis 缓存（示例：`127.0.0.1:6379` 或 `redis://user:pass@host:6379/0`）。
+- `REDIS_PREFIX` – Redis 键前缀，默认 `wecom-robot`。
+- `REDIS_TTL_SECONDS` – Redis 缓存过期时间，默认 86400 秒。
+
+## HTTP Endpoints
+- `GET /`（无参数）– 健康检查，返回 `ok`。
+- `GET /`（带 `msg_signature`、`timestamp`、`nonce`、`echostr`）– 企业微信 URL 验证，解密后原样返回。
+- `POST /`（带签名参数）– 企业微信加密消息入口。
+  - 文本消息并且内容以 `http/https` 开头：异步启动流水线，主线程加密回复 `OK`。
+  - 其余消息：直接返回明文 `success`。
+- `POST /url` – 表单字段 `url`（必须以 `http/https` 开头），用于本地测试，立即返回 `queued`。
+
+## Link Processing Pipeline
+1. **Fetch** – 通过 MCP HTTP 工具获取指定 URL 的 HTML 与元数据，可选文件/Redis 缓存。
+2. **Extract** – 将 HTML 输入 OpenAI 兼容模型，按 `docs/网页内容提取提示语.md` 的提示语生成结构化 JSON。
+3. **Save** – 将 JSON + HTML 组合成 Readwise Reader 文档并调用 `/api/v3/save/` 写入。
+
+每个步骤都会以 `job=<hash> step=<stage>` 形式输出日志；若配置 `READER_LOG_DIR`，会在对应目录中记录请求、提示语、响应与错误详情。
+
+## Development
+```sh
+go fmt ./...
+go vet ./...
+go test ./... -cover
+go build ./...
 ```
-```
+Go 1.23+ 环境下开发测试即可。发布前请确保清理本地 `.env`、`.reader-cache/`、`.reader-logs/` 等包含敏感信息的目录。
