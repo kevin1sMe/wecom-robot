@@ -55,7 +55,7 @@ func NewMux(cfg *config.Config, wc *wecom.WXBizMsgCrypt) *http.ServeMux {
 		}
 		log.Printf("[/url] received url=%s", url)
 		ctx, cancel := context.WithTimeout(context.Background(), params.PipelineTimeout)
-		go func() { defer cancel(); proc.ProcessURL(ctx, url) }()
+		go func() { defer cancel(); proc.ProcessURL(ctx, url, "") }()
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("queued"))
 	})
@@ -166,7 +166,8 @@ func handleMessage(cfg *config.Config, proc *reader.Processor, wc *wecom.WXBizMs
 		if url := firstHTTPURL(rm.Content); url != "" {
 			log.Printf("[DEBUG] 发现URL: %s，开始异步处理", url)
 			ctx, cancel := context.WithTimeout(context.Background(), params.PipelineTimeout)
-			go func() { defer cancel(); proc.ProcessURL(ctx, url) }()
+			sender := rm.FromUserName
+			go func() { defer cancel(); proc.ProcessURL(ctx, url, sender) }()
 		} else {
 			log.Printf("[DEBUG] 文本消息中未触发URL处理（未以 http/https 开头或为空）")
 		}

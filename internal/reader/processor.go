@@ -21,6 +21,7 @@ import (
 	"wecom-robot/internal/config"
 	"wecom-robot/internal/mcpclient"
 	"wecom-robot/internal/params"
+	"wecom-robot/internal/wecom"
 
 	openai "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -47,9 +48,10 @@ type ReadwiseDocument struct {
 
 // Processor coordinates: fetch via MCP streamable HTTP -> LLM extract -> Readwise save
 type Processor struct {
-	cfg *config.Config
-	hc  *http.Client
-	rc  *cache.Redis
+	cfg      *config.Config
+	hc       *http.Client
+	rc       *cache.Redis
+	notifier *wecom.Notifier
 }
 
 func NewProcessor(cfg *config.Config) *Processor {
@@ -62,11 +64,16 @@ func NewProcessor(cfg *config.Config) *Processor {
 		ttl := time.Duration(cfg.RedisTTLSeconds) * time.Second
 		p.rc = cache.NewRedis(cfg.RedisAddr, cfg.RedisPrefix, ttl)
 	}
+	// Optional WeCom active message notifier
+	if cfg.WeComCorpSecret != "" {
+		p.notifier = wecom.NewNotifier(cfg.ReceiveID, cfg.WeComCorpSecret, cfg.WeComAgentID)
+	}
 	return p
 }
 
 // ProcessURL runs the full pipeline asynchronously-safe. Logs errors; no panics.
-func (p *Processor) ProcessURL(ctx context.Context, url string) {
+// toUser is the WeCom user ID to notify after success; empty string skips notification.
+func (p *Processor) ProcessURL(ctx context.Context, url, toUser string) {
 	start := time.Now()
 	job := hashURL(url)
 	jobShort := job
@@ -142,6 +149,20 @@ func (p *Processor) ProcessURL(ctx context.Context, url string) {
 	}
 
 	log.Printf("[reader] job=%s step=process event=end url=%s dur=%s", jobShort, url, time.Since(start))
+
+	// Send WeCom summary notification (best-effort, non-blocking)
+	if toUser != "" && p.notifier != nil && p.notifier.Enabled() && link != "" {
+		go func() {
+			ctxNotify, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			desc := buildNotifyDescription(doc)
+			if err := p.notifier.SendTextCard(ctxNotify, toUser, doc.Title, desc, link); err != nil {
+				log.Printf("[reader] job=%s step=notify event=error err=%v", jobShort, err)
+			} else {
+				log.Printf("[reader] job=%s step=notify event=sent toUser=%s", jobShort, toUser)
+			}
+		}()
+	}
 }
 
 // fetchPage fetches a web page strictly via MCP HTTP server (streamable-http).
@@ -455,6 +476,37 @@ func (p *Processor) traceWrite(dir, name string, data []byte) {
 	}
 	path := filepath.Join(dir, name)
 	_ = os.WriteFile(path, data, 0o644)
+}
+
+// buildNotifyDescription builds the textcard description for a WeCom notification.
+func buildNotifyDescription(doc *ReadwiseDocument) string {
+	var sb strings.Builder
+	// author + date line
+	if doc.Author != "" {
+		sb.WriteString("作者：")
+		sb.WriteString(doc.Author)
+		if doc.PublishedDate != "" {
+			// show only the date portion
+			date := doc.PublishedDate
+			if len(date) >= 10 {
+				date = date[:10]
+			}
+			sb.WriteString(" · ")
+			sb.WriteString(date)
+		}
+		sb.WriteString("\n\n")
+	}
+	// summary
+	if doc.Summary != "" {
+		sb.WriteString(doc.Summary)
+		sb.WriteString("\n")
+	}
+	// tags
+	if len(doc.Tags) > 0 {
+		sb.WriteString("\n标签：")
+		sb.WriteString(strings.Join(doc.Tags, "、"))
+	}
+	return strings.TrimSpace(sb.String())
 }
 
 // Helpers for typing/sanitization

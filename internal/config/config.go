@@ -37,6 +37,10 @@ type Config struct {
 	RedisAddr       string // env: REDIS_ADDR (e.g., 127.0.0.1:6379 or redis://user:pass@host:6379/0)
 	RedisPrefix     string // env: REDIS_PREFIX (default: wecom-robot)
 	RedisTTLSeconds int    // env: REDIS_TTL_SECONDS (default: 86400)
+
+	// WeCom active messaging (optional; enables post-save notification)
+	WeComCorpSecret string // env: WECOM_CORP_SECRET
+	WeComAgentID    int    // env: WECOM_AGENT_ID (default: 1000002)
 }
 
 func FromEnv() (*Config, error) {
@@ -55,8 +59,9 @@ func FromEnv() (*Config, error) {
 		ReadwiseToken:  os.Getenv("READWISE_API_TOKEN"),
 		ReaderCacheDir: os.Getenv("READER_CACHE_DIR"),
 		ReaderLogDir:   os.Getenv("READER_LOG_DIR"),
-		RedisAddr:      os.Getenv("REDIS_ADDR"),
-		RedisPrefix:    os.Getenv("REDIS_PREFIX"),
+		RedisAddr:       os.Getenv("REDIS_ADDR"),
+		RedisPrefix:     os.Getenv("REDIS_PREFIX"),
+		WeComCorpSecret: os.Getenv("WECOM_CORP_SECRET"),
 	}
 	// Optional temperature; if unset or invalid, keep nil to avoid sending the param
 	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {
@@ -78,6 +83,14 @@ func FromEnv() (*Config, error) {
 	}
 	if cfg.RedisPrefix == "" {
 		cfg.RedisPrefix = "wecom-robot"
+	}
+	if v := os.Getenv("WECOM_AGENT_ID"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.WeComAgentID = n
+		}
+	}
+	if cfg.WeComAgentID == 0 {
+		cfg.WeComAgentID = 1000002
 	}
 	// TTL default: 24h if not set or invalid
 	if v := os.Getenv("REDIS_TTL_SECONDS"); v != "" {
