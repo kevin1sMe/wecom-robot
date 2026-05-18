@@ -122,6 +122,8 @@ func (p *Processor) ProcessURL(ctx context.Context, url, toUser string) {
 
 	// 追加上html部分
 	doc.HTML = page.HTML
+	// 强制设为 later（主动收藏的文章直接进待读列表）
+	doc.Location = "later"
 
 	// quick doc size for visibility
 	var docBytes int
@@ -400,7 +402,7 @@ func buildExtractionPrompt(page *mcpclient.Page) string {
 	sb.WriteString("8. summary：基于文章内容生成客观概述，2-4句话\n")
 	sb.WriteString("9. category：按内容类型判断，通常为‘article’\n")
 	sb.WriteString("10. tags：从标题和内容中提取3-8个标签（字符串数组）\n")
-	sb.WriteString("11. location：固定设为‘new’\n")
+	sb.WriteString("11. location：固定设为’later’\n")
 	sb.WriteString("12. saved_using：固定设为‘web_extractor’\n\n")
 
 	sb.WriteString("【重要提醒】\n")
@@ -412,7 +414,7 @@ func buildExtractionPrompt(page *mcpclient.Page) string {
 	sb.WriteString("【输出要求】\n")
 	sb.WriteString("- 仅返回合法JSON对象，字段与类型严格符合Readwise Reader API\n")
 	sb.WriteString("- published_date为完整ISO8601(+08:00)或null\n")
-	sb.WriteString("- 不要包含 html 字段；should_clean_html=true；location=\"new\"；saved_using=\"web_extractor\"\n")
+	sb.WriteString("- 不要包含 html 字段；should_clean_html=true；location=\"later\"；saved_using=\"web_extractor\"\n")
 	return sb.String()
 }
 
