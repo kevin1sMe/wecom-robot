@@ -44,6 +44,9 @@ type Config struct {
 
 	// Readwise save location: new|later|archive|feed (default: new)
 	ReadwiseSaveLocation string // env: READWISE_SAVE_LOCATION
+
+	// Optional API token for authenticating POST /url requests (Bearer token)
+	APIToken string // env: API_TOKEN (if empty, no auth is enforced)
 }
 
 func FromEnv() (*Config, error) {
@@ -66,6 +69,7 @@ func FromEnv() (*Config, error) {
 		RedisPrefix:     os.Getenv("REDIS_PREFIX"),
 		WeComCorpSecret:      os.Getenv("WECOM_CORP_SECRET"),
 		ReadwiseSaveLocation: os.Getenv("READWISE_SAVE_LOCATION"),
+		APIToken:             os.Getenv("API_TOKEN"),
 	}
 	// Optional temperature; if unset or invalid, keep nil to avoid sending the param
 	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {

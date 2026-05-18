@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -37,27 +39,58 @@ type receivedMessage struct {
 func NewMux(cfg *config.Config, wc *wecom.WXBizMsgCrypt) *http.ServeMux {
 	mux := http.NewServeMux()
 	proc := reader.NewProcessor(cfg)
-	// Testing helper: POST /url with form field "url" to trigger the same
-	// pipeline as WeCom text message link handling.
+	// POST /url — RESTful endpoint to trigger the same pipeline as WeCom messages.
+	// Accepts: application/json {"url":"..."} or application/x-www-form-urlencoded url=...
+	// Auth: if API_TOKEN is set, requires "Authorization: Bearer <token>" header.
+	// Response: {"status":"queued","job":"<sha256[:8]>"}
 	mux.HandleFunc("/url", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "invalid form", http.StatusBadRequest)
-			return
+
+		// Bearer token auth (enforced only when API_TOKEN is configured)
+		if cfg.APIToken != "" {
+			auth := r.Header.Get("Authorization")
+			if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != cfg.APIToken {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
 		}
-		url := strings.TrimSpace(r.FormValue("url"))
-		if url == "" || (!strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://")) {
+
+		// Parse URL from JSON body or form
+		var rawURL string
+		ct := r.Header.Get("Content-Type")
+		if strings.HasPrefix(ct, "application/json") {
+			var payload struct {
+				URL string `json:"url"`
+			}
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+			if err := json.Unmarshal(body, &payload); err != nil {
+				http.Error(w, "invalid json", http.StatusBadRequest)
+				return
+			}
+			rawURL = strings.TrimSpace(payload.URL)
+		} else {
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, "invalid form", http.StatusBadRequest)
+				return
+			}
+			rawURL = strings.TrimSpace(r.FormValue("url"))
+		}
+
+		if rawURL == "" || (!strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://")) {
 			http.Error(w, "missing or invalid url", http.StatusBadRequest)
 			return
 		}
-		log.Printf("[/url] received url=%s", url)
+
+		job := urlJobID(rawURL)
+		log.Printf("[/url] received url=%s job=%s", rawURL, job)
 		ctx, cancel := context.WithTimeout(context.Background(), params.PipelineTimeout)
-		go func() { defer cancel(); proc.ProcessURL(ctx, url, "") }()
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("queued"))
+		go func() { defer cancel(); proc.ProcessURL(ctx, rawURL, "") }()
+
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "queued", "job": job})
 	})
 	// 仅使用根路径作为回调 URL
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -203,6 +236,12 @@ func randString(n int) string {
 		b[i] = letters[rand.Intn(len(letters))]
 	}
 	return string(b)
+}
+
+// urlJobID returns the first 8 hex chars of the URL's SHA-256, matching Processor's internal jobShort.
+func urlJobID(url string) string {
+	sum := sha256.Sum256([]byte(url))
+	return fmt.Sprintf("%x", sum[:4])
 }
 
 // firstHTTPURL 提取文本中的第一个 http/https 链接
