@@ -283,11 +283,13 @@ func (p *Processor) extractMetadataFromLLM(ctx context.Context, page *mcpclient.
 		return nil, errors.New("LLM not configured")
 	}
 
-	// Truncate excessively long HTML to reduce token usage
+	// Truncate excessively long HTML to stay within LLM context limits
 	const maxChars = 200_000
-	if len(page.HTML) > maxChars {
-		log.Printf("[reader] job=%s step=extract_meta event=html_too_long chars=%d max=%d", jobShort, len(page.HTML), maxChars)
-		return nil, fmt.Errorf("html too long, %d chars", len(page.HTML))
+	html := page.HTML
+	if len(html) > maxChars {
+		log.Printf("[reader] job=%s step=extract_meta event=html_truncated chars=%d max=%d", jobShort, len(html), maxChars)
+		html = html[:maxChars]
+		page = &mcpclient.Page{URL: page.URL, HTML: html, Metadata: page.Metadata}
 	}
 
 	systemPrompt := "你是一名严谨的网页内容解析器。只输出一个合法 JSON 对象，不要输出任何多余字符，也不要使用 Markdown 代码块。严禁在 JSON 中包含原始 HTML 或 Markdown 内容（不要返回 html 字段）。JSON 必须严格符合 Readwise Reader 保存接口所需的字段与类型。"
