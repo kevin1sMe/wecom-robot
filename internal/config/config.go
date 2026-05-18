@@ -41,6 +41,9 @@ type Config struct {
 	// WeCom active messaging (optional; enables post-save notification)
 	WeComCorpSecret string // env: WECOM_CORP_SECRET
 	WeComAgentID    int    // env: WECOM_AGENT_ID (default: 1000002)
+
+	// Readwise save location: new|later|archive|feed (default: new)
+	ReadwiseSaveLocation string // env: READWISE_SAVE_LOCATION
 }
 
 func FromEnv() (*Config, error) {
@@ -61,7 +64,8 @@ func FromEnv() (*Config, error) {
 		ReaderLogDir:   os.Getenv("READER_LOG_DIR"),
 		RedisAddr:       os.Getenv("REDIS_ADDR"),
 		RedisPrefix:     os.Getenv("REDIS_PREFIX"),
-		WeComCorpSecret: os.Getenv("WECOM_CORP_SECRET"),
+		WeComCorpSecret:      os.Getenv("WECOM_CORP_SECRET"),
+		ReadwiseSaveLocation: os.Getenv("READWISE_SAVE_LOCATION"),
 	}
 	// Optional temperature; if unset or invalid, keep nil to avoid sending the param
 	if v := os.Getenv("LLM_TEMPERATURE"); v != "" {
@@ -91,6 +95,12 @@ func FromEnv() (*Config, error) {
 	}
 	if cfg.WeComAgentID == 0 {
 		cfg.WeComAgentID = 1000002
+	}
+	switch cfg.ReadwiseSaveLocation {
+	case "new", "later", "archive", "feed":
+		// valid
+	default:
+		cfg.ReadwiseSaveLocation = "new"
 	}
 	// TTL default: 24h if not set or invalid
 	if v := os.Getenv("REDIS_TTL_SECONDS"); v != "" {
