@@ -153,12 +153,16 @@ func (p *Processor) ProcessURL(ctx context.Context, url, toUser string) {
 	log.Printf("[reader] job=%s step=process event=end url=%s dur=%s", jobShort, url, time.Since(start))
 
 	// Send WeCom summary notification (best-effort, non-blocking)
-	if toUser != "" && p.notifier != nil && p.notifier.Enabled() && link != "" {
+	if toUser != "" && p.notifier != nil && p.notifier.Enabled() {
+		notifyLink := link
+		if notifyLink == "" {
+			notifyLink = url
+		}
 		go func() {
 			ctxNotify, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			desc := buildNotifyDescription(doc)
-			if err := p.notifier.SendTextCard(ctxNotify, toUser, doc.Title, desc, link); err != nil {
+			if err := p.notifier.SendTextCard(ctxNotify, toUser, doc.Title, desc, notifyLink); err != nil {
 				log.Printf("[reader] job=%s step=notify event=error err=%v", jobShort, err)
 			} else {
 				log.Printf("[reader] job=%s step=notify event=sent toUser=%s", jobShort, toUser)
